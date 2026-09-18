@@ -171,7 +171,10 @@ verify() {
 
   hr
   if [ "$FAILED" = 0 ]; then
-    echo "${c_g}服务就绪${c_0}  API http://$(hostname -I 2>/dev/null | awk '{print $1}'):${PORT}   日志 $log"
+    local api
+    api=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^10\.100\.' | head -1)
+    [ -n "${api:-}" ] || api=$(hostname -I 2>/dev/null | awk '{print $1}')
+    echo "${c_g}服务就绪${c_0}  API http://${api}:${PORT}   日志 $log"
     echo "        基准：python3 bench_decode.py 300   ｜   python3 bench_conc.py http://127.0.0.1:${PORT} 4 200"
   else
     echo "${c_r}验证未全通过${c_0}（见 ✗）；日志 $log"; return 1
