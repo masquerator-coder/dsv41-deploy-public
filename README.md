@@ -144,10 +144,12 @@ RoCE 50–100 µs。切到 RoCE 后单流 **+60~85%**、4 并发 **+75%**。
 # 1) 链路：MTU 9000 + /32 直连路由（三台都执行，或用 assets/ 里的 netplan 持久化）
 sudo bash scripts/fabric-mtu-route.sh
 
-# 2) 起服务（在 head 上）
+# 2) 起服务（在 head 上；svc.sh 会把预检/share/等就绪/三层验证串起来，约 13–15 分钟）
 cp env.example .env            # 按需修改 IP/HCA/内存水位
-./start.sh share               # 每次重启后必须先 share，否则 worker 挂载检查会卡住
-(setsid nohup ./start.sh serve > serve-$(date +%m%d-%H%M).log 2>&1 &)   # 约 13–15 分钟
+./svc.sh start                 # 预检 → share → serve → 等就绪 → 三层验证
+# 其余子命令：./svc.sh status（只读体检）｜stop｜restart｜preflight｜logs -f
+# 若不用脚本，手工等价步骤：
+#   ./start.sh share && (setsid nohup ./start.sh serve > serve-$(date +%m%d-%H%M).log 2>&1 &)
 
 # 3) 三层验证（缺一不可）
 curl -s http://127.0.0.1:8888/health -w " %{http_code}\n"                     # 200
@@ -175,6 +177,7 @@ docs/PITFALLS.md            避坑清单（按现象索引）
 docs/ROCE-INVESTIGATION.md  历史排查记录（旧接线 / 坏内核 / 镜像残留，已作废，见文首更正）
 docs/UPSTREAM-ISSUE.md      提交给上游的 issue 全文 + 结案更正
 scripts/                    可直接复用的脚本（链路、探针、基准、内核切换）
+  svc.sh                    服务启停与体检：preflight / start / stop / restart / status / logs
 assets/                     netplan 示例
 env.example                 环境变量样例（已脱敏，RoCE 档）
 ```
