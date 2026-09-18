@@ -1,0 +1,1 @@
+3 节点三角（3× DGX Spark / CX7 直连）NCCL over RoCE 跑通 —— 更正：根因是我们的环境（接线 + 内核 CMA + 镜像 NCCL 残留），并非 NCCL 缺陷
