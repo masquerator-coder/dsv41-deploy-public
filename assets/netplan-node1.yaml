@@ -1,0 +1,32 @@
+network:
+  version: 2
+  renderer: NetworkManager
+  ethernets:
+    enP2p1s0f0np0:
+      networkmanager:
+        uuid: "c496e5d4-9af4-46c6-b783-6f47c2c20a38"
+      dhcp4: false
+      mtu: 9000
+      addresses:
+        - 10.100.179.2/24
+    enP2p1s0f1np1:
+      networkmanager:
+        uuid: "81d5c612-72a9-4016-b43e-dbd60c2ad529"
+      dhcp4: false
+      mtu: 9000
+      addresses:
+        - 10.100.181.2/24
+    enp1s0f0np0:
+      networkmanager:
+        uuid: "bed089d6-4f73-4f45-959f-a514435a669d"
+      dhcp4: false
+      mtu: 9000
+      addresses:
+        - 10.100.178.2/24
+    enp1s0f1np1:
+      networkmanager:
+        uuid: "9e736836-af00-426f-85ae-279b33c062c9"
+      dhcp4: false
+      mtu: 9000
+      addresses:
+        - 10.100.180.2/24

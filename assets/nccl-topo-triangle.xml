@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!-- Custom NCCL topology for the 3x DGX Spark triangle.
+
+     Motivation: nvidia-smi reports the GPU at PCI domain 0000000F while the four
+     ConnectX-7 ports sit in domains 0000 (rocep1s0f*) and 0002 (roceP2p1s*), so
+     NCCL's automatic distance model cannot place them well. Declaring the GPU and
+     all four NICs as siblings under one bridge makes every NIC PIX with the GPU,
+     i.e. equally close, so device choice is decided by the ring-device override
+     and the per-rank NCCL_IB_HCA order rather than by distance.
+-->
+<system version="1">
+  <cpu numaid="0" affinity="0-19" arch="aarch64" vendor="NVIDIA" family="0" model="0" modelid="0" mhz="0">
+    <pci busid="0000000F:01:00.0" class="0x030200" link_speed="16.0 GT/s PCIe" link_width="16">
+      <gpu dev="0" sm="121" rank="0" gdr="1" />
+      <nic dev="rocep1s0f0" />
+      <nic dev="rocep1s0f1" />
+      <nic dev="roceP2p1s0f0" />
+      <nic dev="roceP2p1s0f1" />
+    </pci>
+  </cpu>
+</system>
