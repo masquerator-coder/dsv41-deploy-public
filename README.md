@@ -1,160 +1,207 @@
-# 3× DGX Spark 部署 DeepSeek-V4.1-Flash（TP=3 跨三机）· 可用方案
+# 3× DGX Spark 部署 DeepSeek-V4.1-Flash（TP=3 跨三机）· RoCE 方案
 
 三台 DGX Spark（GB10）用 CX7 直连成**三角**拓扑，跑起 DeepSeek-V4.1-Flash 推理服务。
-**结论先行**：这套三角拓扑下 NCCL 的 IB/RoCE 路径不可用（上游已受理 issue），
-**可用方案是让 NCCL 走 socket/TCP over 同一批 CX7 链路**，实测单流 **18–19 tok/s**、
-4 并发聚合 **约 40 tok/s**。
 
-> 本文档描述的是**已经跑通并验证过**的配置，包含全部踩坑记录与九条 RoCE 路线的实测结论。
+**结论先行（2026-09-19 更新）**：这套三角拓扑上 **NCCL 的 IB/RoCE 路径可用**，实测
+单流 **28.5–35.4 tok/s**、4 并发聚合 **67.5–75.8 tok/s**、预填 **≈3.0k tok/s**、fabric
+`all_reduce` 256 MB **13.86 GB/s**。
+
+> ⚠️ **本仓库早期版本（commit `3c7a016`）的结论"RoCE 走不通、只能 socket"是错的**——
+> 那是在**错误接线 + 有 CMA 回归的内核 + 引擎镜像里残留的 NCCL 开关**三重问题上得出的。
+> 三条都修正后一次通过。旧记录里"九条路线实测"的价值只剩"哪些旋钮是负收益"，
+> 请以本文为准；`docs/ROCE-INVESTIGATION.md` 已标注为**历史记录（已作废）**。
 
 ---
 
-## 1. 这套方案长什么样
+## 1. 接线：这是能不能走 RoCE 的第一决定因素
 
 ```
-        node1 (head)              node2                    node3
-        GPU: GB10                 GPU: GB10                GPU: GB10
-        ┌──────────┐   W2   ┌──────────┐   W3   ┌──────────┐
-        │ p1 ──────┼────────┼─ p0      │        │          │
-        │ p0 ──────┼────────┼──────────┼────────┼─ p0      │
-        └──────────┘   W1   └────┬─────┘        └────┬─────┘
-                                 └────── p1 ──────────┘
-                          W1: node1-p0 ↔ node3-p0
-                          W2: node1-p1 ↔ node2-p0
-                          W3: node2-p1 ↔ node3-p1
+        正确（交叉环）                          错误（会 110 / 静默死）
+        W1: n1.p0 ↔ n3.p1                      W1: n1.p0 ↔ n3.p0
+        W2: n1.p1 ↔ n2.p0                      W2: n1.p1 ↔ n2.p0
+        W3: n2.p1 ↔ n3.p0                      W3: n2.p1 ↔ n3.p1
 ```
 
-- **只有 3 根线**，构成一个三角（不是 rail，也没有交换机）。
-- 每根线在**两张 PCI 卡上各有一个端口**（同一根线的两个 24 位子网视图），因此每台机器有
-  **4 个 RDMA 设备 / 4 个 fabric 地址**，但物理上只有 2 根线。
-- 这带来一个关键后果：**一个 rank 的两个邻居分属不同网卡**，而 NCCL 的 IB 传输层默认假设
-  "按设备索引配对、两端同轨"。这个假设在三角里不成立 → 见 §4。
+**心智模型**：每台 Spark 的 2 个物理 QSFP 口会在**两个 PCI 域各暴露一个 netdev**
+（`phys_switch_id` 相同、`phys_port_name` 为 `p0/p1/p0/p1`），所以每台看起来有 4 个 RDMA 设备、
+4 个 fabric 地址、全网 6 个 `/24` —— **物理上只有 3 根线**，域 2 那批是同一根缆的第二层视图。
+**一个 `/24` 只属于一根缆**。
 
-## 2. 可行的传输配置（核心）
+**为什么必须是"每条缆 p0↔p1"**：NCCL 按 channel→NIC 的**设备索引**跨 rank 配对
+（`ncclTopoSearchCheckNet`，索引 0 = PCI 域最小的卡 = 三台都是 `p0`）。只要有两根缆接在**同一端口索引**上，
+就必然存在"被配到一起的两个口不在同一根缆上"的索引 → `ibv_modify_qp 110 Connection timed out`
+（重试 35 次后放弃），或表现为无 NCCL 告警的静默死。改成每条缆 **p0↔p1** 后，配合
+`NCCL_IB_SUBNET_AWARE_ROUTING=1`（接收侧按对端当前 GID 的同 `/24` 逐连接选本地口），NCCL 层一次通过。
 
-数据面走 **socket/TCP**，但**链路上仍然是那几条 CX7 直连线**：
+现役地址表（实测）：
+
+| 节点 | `p0·域0` | `p1·域0` | `p0·域2` | `p1·域2` |
+|---|---|---|---|---|
+| n1 head | 10.100.178.2 | 10.100.180.2 | 10.100.179.2 | 10.100.181.2 |
+| n2 | 10.100.180.1 | 10.100.176.2 | 10.100.181.1 | 10.100.177.2 |
+| n3 | 10.100.176.1 | 10.100.178.1 | 10.100.177.1 | 10.100.179.1 |
+
+> 从错误接线改成正确接线，本集群只动了 **n3 的两个 QSFP 插头**，并把 **n3 的四个 fabric IP 整体对调**
+> （`p0` 那对 ↔ `p1` 那对），`/32` 路由的 `dev` 跟着改。
+
+**每台必做的链路配置**（示例见 `assets/`）：
+
+1. 四个 fabric 口 **MTU 9000**；
+2. 为**每个对端**加 `/32` 直连路由，让流量走直连线而不是绕管理网；
+3. 以上两项**必须写进 netplan / NetworkManager**——临时 `ip route add` 会被 NM re-apply 冲掉，
+   症状是到 fabric 的 TCP 停在 `SYN-SENT` 且**源地址是 WiFi**，引擎 init 永久挂起；
+4. **`/etc/nvidia/cx7-hotplug-enabled` 必须移走**（三台都查）：留着的话某台重启会把 ConnectX 口
+   从**邻居**的 PCI 总线上摘掉，fabric 局部静默消失。
 
 ```bash
-# 传输选择
-NCCL_NET=Socket
-NCCL_IB_DISABLE=1
-NCCL_SOCKET_IFNAME=enp1s0f0np0     # 数据面网卡（各机同名）
-GLOO_SOCKET_IFNAME=wlP9s9          # bootstrap 走管理/WiFi 网卡，避免和数据面抢
+# 应用网络改动（不要用 netplan apply，免得连带重置管理网 WiFi）
+sudo netplan generate && nmcli con reload && nmcli dev reapply <iface>
+```
 
-# 其余保持配方默认
+**接线验证（四件套）**：
+
+```bash
+# ① 四条 ConnectX function 都满速：期望 32.0 GT/s x4
+for f in $(lspci -D -d 15b3: | awk '{print $1}'); do
+  echo $f $(cat /sys/bus/pci/devices/$f/current_link_speed) x$(cat /sys/bus/pci/devices/$f/current_link_width); done
+# ② IB 口全 ACTIVE（某台离线时，1: DOWN / phys 3: Disabled 的口就是通往那台的缆）
+for d in /sys/class/infiniband/*; do echo "$(basename $d) $(cat $d/ports/1/state)"; done
+# ③ 源口 ping（同缆通、异缆必须不通）
+ping -I enp1s0f0np0 10.100.178.1 && echo 同缆OK
+```
+
+> ⚠️ 只靠 `ping -I` 判同缆**不可靠**：存在 `/32` 路由时，指定源地址的包仍按路由表选 `dev`，
+> 会对异缆地址"通"。严格判定请用 L2 ARP 探针（AF_PACKET，不带网段语义）。
+
+**控制面必须走管理网**：`NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` 用 WiFi 管理口 `wlP9s9`。
+它决定每个 rank 公布的 bootstrap 监听地址；设成 fabric 口时各节点公布自己那个口的 fabric IP，
+三角里这些 IP 两两不在同一根缆上、又无路由 → 内核改走默认路由 → 永久 `SYN-SENT`、
+**NCCL 一行日志都不打**、三台空转。诊断：`sudo ss -tnp | grep 10.100`。
+
+## 2. 另两条前提（同样致命，且都不在 NCCL 里）
+
+| # | 问题 | 判据 | 修法 |
+|---|---|---|---|
+| ① | **内核 CMA 回归**：`7.0.0-1019-nvidia` 上 `ibv_reg_mr_iova2` 必然 `Cannot allocate memory`（连 **1 KB** 区域都失败，而此时节点有 9 GB 空闲）⇒ 引擎建后续 communicator 时 `ncclSystemError` | `grep CmaTotal /proc/meminfo` = **`0 kB`**（正常内核 `131072 kB`） | 内核/驱动配对切到 **`6.17.0-1031-nvidia` + `580.173.02`**；`GRUB_DEFAULT="1>2"` + `update-grub` + `apt-mark hold` 防自动升回 |
+| ② | **引擎镜像 `/etc/nccl.conf` 残留**：`NCCL_IB_USE_INLINE=1` + `NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS=1` ⇒ pynccl 的 **4 字节** warmup all_reduce 永久冻死，日志停在 `sglang is using nccl==2.30.7`，GPU 96% 但功耗仅 ~16 W（自旋） | `docker exec <容器> cat /etc/nccl.conf` | 给 `start.sh` 补透传并置 0：`patch_startsh_envvar.py NCCL_IB_USE_INLINE 0`、`... NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS 0`（进程 env 优先于 conf 文件） |
+
+> ② 之所以长期被误诊：所有"能通过"的独立 smoke / 探针跑的**都是基础镜像**（不带该文件），
+> 于是形成"单测能过、引擎卡死"的假矛盾。**复现必须用引擎镜像**跑探针。
+> 别被 memlock 误导：引擎容器带 `--ulimit memlock=-1:-1`；**裸 `docker run` 的容器内默认只有 8192**。
+
+## 3. 传输配置
+
+### 3.1 RoCE（推荐）
+
+```bash
+NCCL_NET=IB
+NCCL_IB_DISABLE=0
+NCCL_IB_HCA=rocep1s0f0,rocep1s0f1      # 每台两个逻辑口 = 域0 的两个物理口
+NCCL_IB_GID_INDEX=3                     # RoCE v2 + fabric IPv4
+NCCL_IB_SUBNET_AWARE_ROUTING=1          # 交叉环下靠它逐连接选对网卡（不要关）
+NCCL_IB_MERGE_NICS=0
+NCCL_NET_PLUGIN=none
+NCCL_CROSS_NIC=0
+NCCL_SOCKET_IFNAME=wlP9s9               # 控制面走管理网
+GLOO_SOCKET_IFNAME=wlP9s9
+NCCL_P2P_DISABLE=1
+NCCL_SHM_DISABLE=1
 NCCL_MAX_NCHANNELS=8
 NCCL_BUFFSIZE=1048576
 NCCL_PROTO='^LL128'
-NCCL_P2P_DISABLE=1
-NCCL_SHM_DISABLE=1
+NCCL_DEBUG_SUBSYS=INIT,NET,ENV
+NCCL_HOST_DIR=/nonexistent-nccl-host-dir   # 禁挂自建 NCCL，用镜像自带
 ```
 
-链路侧必须做的两件事（`scripts/fabric-mtu-route.sh`，已用 netplan 持久化，见 `assets/`）：
+### 3.2 socket 回退（RoCE 出问题时的一键退路）
 
-1. **所有 fabric 口 MTU 9000**（含两张卡的 4 个口）；
-2. **为每个对端加 `/32` 直连路由**，让 TCP 直接走直连线而不是绕管理网。
-
-> ⚠️ 临时 `ip route add` 会被 NetworkManager 清掉（表现为引擎卡死在不可达路由上）。**必须写进 netplan**（示例见 `assets/netplan-99-cluster.yaml`）。
-
-## 3. 实测性能
-
-| 指标 | 数值 |
-|---|---|
-| 单流解码 | **17.9 – 19.2 tok/s** |
-| 4 并发聚合 | **39.7 – 43.3 tok/s** |
-| fabric 单向带宽 | 2.07 – 2.14 GB/s（MTU 9000 + 直连路由；MTU 1500 时约 1.75 GB/s） |
-| 4 并发时的实际占用 | 每链路约 225 MB/s，**仅占理论上限 32%** |
-| 模型服务 | `max_model_len=262144`、`max_total_num_tokens=499968` |
-
-**为什么是 socket 而不是 RoCE**：实测瓶颈不在带宽（只用掉 32%），而在**每一步约 104 次集合通信的
-延迟**（socket 约 1 ms/次，RoCE 50–100 µs）。所以"换成 RoCE"是唯一能显著提速的方向 —— 但在这套
-拓扑上走不通，原因见下节。
-
-## 4. RoCE 为什么走不通（结论 + 证据）
-
-我们在**九条路线**上做了单变量实测，全部失败，且都收敛到同一个 NCCL 内部错误：
-
-```
-transport/net_ib/p2p.cc:703 (ncclIbCompletionEventProcess)
-  NCCL WARN NET/IB: Recv comm could not retreive a request found for a successful completion
-ncclInternalError: Internal check failed
+```bash
+NCCL_NET=Socket
+NCCL_IB_DISABLE=1
+NCCL_SOCKET_IFNAME=enp1s0f0np0          # 数据面仍走 CX7 直连线
+GLOO_SOCKET_IFNAME=wlP9s9
 ```
 
-| # | 路线 | 结果 |
+## 4. 实测性能（同机同配方，只换传输）
+
+| 指标 | **RoCE（当前）** | socket 回退 |
 |---|---|---|
-| 1–2 | 直连三角的默认配置 / bootstrap 平面分离 | `ibv_modify_qp 110` |
-| 3 | `NCCL_CROSS_NIC=1` | 110 |
-| 4 | `NCCL_IB_MERGE_NICS=1` | QP 建起来、数据通过，但撞 `p2p.cc` 内部错误 |
-| 5 | 自研补丁 NCCL（按 `NCCL_IB_HCA` 顺序注册设备）+ 按线缆图排 per-rank HCA 顺序 | **110 消失**，仍撞 `p2p.cc` |
-| 6 | 上游 AICAD ring-only 补丁栈（v1+v4+stageB，逐对端设备映射） | **110 消失**、`Tree=0/Ring=1` 生效，仍撞 `p2p.cc` |
-| 7 | 确保容器内**只有一套 NCCL**（覆盖镜像自带路径）+ 6 项变量矩阵 | 仍撞 `p2p.cc` |
-| 8 | 每机 2 口（一根线一个口）/ 自定义 `NCCL_TOPO_FILE` | 挂住 / 仍撞 `p2p.cc` |
-| 9 | 复刻上游生产组合（驱动 580.173.02 + 内核 6.17.0-1031） | 仍撞 `p2p.cc` |
+| 单流解码 | **28.5 / 29.8 / 33.8 tok/s** | 17.9 – 19.2 |
+| 4 并发聚合 | **67.5 / 75.6 / 75.7 / 75.8 tok/s** | 39.7 – 43.3 |
+| 预填 | **≈3.0k tok/s**（4816 token / 1.59 s） | ~2.0k |
+| fabric `all_reduce` 256 MB | **13.86 GB/s**（1 MB 8.1 / 16 MB 13.2） | 2.07 – 2.14 GB/s |
+| 模型服务 | `max_model_len=262144`、`max_total_num_tokens=499968` | 同 |
 
-完整记录见 [`docs/ROCE-INVESTIGATION.md`](docs/ROCE-INVESTIGATION.md)，已向上游提交：
-**luxingcom/aicad-nccl-optimization#1**（[链接](https://github.com/luxingcom/aicad-nccl-optimization/issues/1)）。
-
-**结论**：NCCL 的 IB 传输层无法表达"一个 rank 的两个邻居分属两张卡"的三角形形状。
-出路只有两条：**加一台 RoCE 交换机**（恢复标准 rail，预期 13–17 GB/s），或**等上游修**。在此之前
-socket/TCP 是最优可用解。
+**为什么差这么多**：瓶颈不是带宽，而是**每一步约 104 次集合通信的延迟**——socket 单次约 1 ms、
+RoCE 50–100 µs。切到 RoCE 后单流 **+60~85%**、4 并发 **+75%**。
+（并发档仍略低于社区同配方参考 78.6 tok/s，剩余空间在 SPS 表与 batch 档位。）
 
 ## 5. 快速上手
 
 ```bash
+# 0) 前置：内核/驱动配对（§2 ①）+ engine 侧两个开关（§2 ②）+ 接线与链路（§1）
+
 # 1) 链路：MTU 9000 + /32 直连路由（三台都执行，或用 assets/ 里的 netplan 持久化）
 sudo bash scripts/fabric-mtu-route.sh
 
-# 2) 用 socket 传输启动（在 head 上）
+# 2) 起服务（在 head 上）
 cp env.example .env            # 按需修改 IP/HCA/内存水位
 ./start.sh share               # 每次重启后必须先 share，否则 worker 挂载检查会卡住
-./start.sh serve
+(setsid nohup ./start.sh serve > serve-$(date +%m%d-%H%M).log 2>&1 &)   # 约 13–15 分钟
 
-# 3) 验证
-curl -s http://127.0.0.1:8888/health          # 期望 200
-curl -s http://127.0.0.1:8888/v1/models       # 期望看到 deepseek-v4.1-flash
+# 3) 三层验证（缺一不可）
+curl -s http://127.0.0.1:8888/health -w " %{http_code}\n"                     # 200
+docker ps --format "{{.Names}} {{.Status}}"                                    # 三台容器 healthy
+L=$(ls -t serve-*.log|head -1)                                                 # 传输归属
+grep -m2 -E "Using network|Assigned NET plugin" $L; grep -c "via NET/IB" $L; grep -c ibv_reg_mr_iova2 $L
+#   期望：Using network IB / Assigned NET plugin IB / via NET/IB ≈64 / reg_mr 失败 = 0
 python scripts/bench_decode.py --url http://127.0.0.1:8888
 ```
 
-**运维铁律**（完整 14 条见 [`docs/PITFALLS.md`](docs/PITFALLS.md)）：
+**运维铁律**（完整清单见 [`docs/PITFALLS.md`](docs/PITFALLS.md)）：
 
-1. 重启后**先 `./start.sh share` 再 `serve`**（否则 worker 的 NFS 检查要卡十几分钟）；
-2. NFSv4 `fsid=0` 导出时，客户端必须挂**伪根 `:/`**，不是子目录；
-3. **绝不要 `docker ps -q | xargs docker rm -f`** —— 引擎容器也在列表里；
-4. `MEM_FRACTION_STATIC` 用配方给的 0.95（低于 0.944 会出现 "weights leave no GPU memory for the KV cache"）。
+1. **一轮失败后必须三台重启再开下一轮**——残留容器与挂起上下文会让下一轮在更早的地方假失败；
+2. 重启后**先 `./start.sh share` 再 `serve`**（否则 worker 的 NFS 检查静默卡十几分钟）；
+3. NFSv4 `fsid=0` 导出时，客户端必须挂**伪根 `:/`**，不是子目录；
+4. **绝不要 `docker ps -q | xargs docker rm -f`** —— 引擎容器也在列表里；
+5. `MEM_FRACTION_STATIC` 用 0.95（低于 0.944 会报 "weights leave no GPU memory for the KV cache"）；
+6. 新增 `.env` 变量必须补透传（`patch_startsh_envvar.py`），`bash -n` 查不出这类拼接错误。
 
 ## 6. 仓库结构
 
 ```
-docs/DEPLOY-GUIDE.md        完整部署手册（正确流程 + 14 条踩坑）
+docs/DEPLOY-GUIDE.md        完整部署手册（流程 + 踩坑；结论以本 README §1–§4 为准）
 docs/PITFALLS.md            避坑清单（按现象索引）
-docs/ROCE-INVESTIGATION.md  九条 RoCE 路线的完整实测记录与证据
-docs/UPSTREAM-ISSUE.md      提交给上游的 issue 全文
-scripts/                    可直接复用的脚本（链路、探针、基准、内核切换、NCCL 补丁应用）
-assets/                     netplan 示例、自定义 NCCL 拓扑文件
-env.example                 环境变量样例（已脱敏）
+docs/ROCE-INVESTIGATION.md  历史排查记录（旧接线 / 坏内核 / 镜像残留，已作废，见文首更正）
+docs/UPSTREAM-ISSUE.md      提交给上游的 issue 全文 + 结案更正
+scripts/                    可直接复用的脚本（链路、探针、基准、内核切换）
+assets/                     netplan 示例
+env.example                 环境变量样例（已脱敏，RoCE 档）
 ```
 
 ## 7. 硬件/软件基线（实测环境）
 
 | 项 | 值 |
 |---|---|
-| 节点 | 3 × DGX Spark（GB10），每机 1 颗 GPU |
-| 内核 / 驱动 | `7.0.0-1019-nvidia` / `580.178.04` |
-| NCCL | 官方 2.30.7（socket 路径不依赖补丁；IB 路线见 §4） |
-| 容器 | 厂商 sglang 镜像 + 官方配方脚本 |
+| 节点 | 3 × DGX Spark（GB10），每机 1 颗 GPU，121.7 GiB 统一内存 |
+| 内核 / 驱动 | **`6.17.0-1031-nvidia` / `580.173.02`**（配对标；`7.0.0-1019` 有 CMA 回归，见 §2） |
+| NCCL | 镜像自带 2.30.7（**不需要任何补丁**；早期"补丁 NCCL"实验是为绕开错误接线，现已不需要） |
+| 容器 | 厂商 sglang 镜像 + 官方配方脚本（注意 §2 ② 的 `/etc/nccl.conf`） |
 
-> 注：DGX 上**驱动与内核是配对的**（如 `580.173.02 ↔ 6.17.0-1031`、`580.178.04 ↔ 7.0.0-1019`），
-> 换内核必须同时换驱动；相关脚本与坑见 `scripts/kernel-driver-*.sh` 与 `docs/PITFALLS.md`。
+> DGX 上**驱动与内核是配对的**（`580.173.02 ↔ 6.17.0-1031`、`580.178.04 ↔ 7.0.0-1019`），
+> 换内核必须同时换驱动；降级驱动会卸掉当前内核的驱动模块，所以"降驱动 + 引导旧内核"必须成对做。
 
 ## 8. 已知限制
 
-- RoCE 不可用（见 §4），因此单流吞吐受 socket 延迟限制，约为 RoCE 方案预期值的 1/2 ~ 1/3；
-- SPS（投机解码的吞吐表）在当前构建下无法生效（三处 shape 不一致，详见 `docs/ROCE-INVESTIGATION.md` 附注）；
-- 单流解码延迟有波动（0.9 s ↔ 18 s），已排除 GPU 降频（三台 2.1–2.3 GHz、节流位 0x0）与带宽瓶颈，根因未定位。
+- SPS（投机解码吞吐表）在当前构建下无法生效（`compact` ragged-verify 启动即崩，三处 shape 不一致），
+  当前用 `static`，表 inert；对并发 ≥2 的场景本可有收益；
+- 尚未验证：视觉分支（带图请求）、工具调用（DSML 标签带前导空格）、`swapoff -a`；
+- 单流解码延迟仍有波动（0.9 s ↔ 18 s），已排除 GPU 降频（三台 2.1–2.3 GHz、节流位 0x0）与带宽瓶颈。
 
 ## 9. 许可与致谢
 
 - 本仓库文档与脚本：MIT（见 `LICENSE`）。
 - 不包含任何厂商源码或镜像内容；引用的第三方补丁请遵循其各自仓库的许可。
-- 感谢 `luxingcom/aicad-nccl-optimization` 与 LuZ 生产栈作者公开 ring-only 补丁与构建记录，
-  它们把问题从"QP 建不起来"推进到了"连接建立后死在完成队列"，为定位提供了关键对照。
+- 感谢 `luxingcom/aicad-nccl-optimization` 与 LuZ 生产栈作者公开 ring-only 补丁与构建记录：
+  它们在我们接线错误、内核有 CMA 回归的阶段提供了关键对照，也促成了最终定位
+  （结论见 `docs/UPSTREAM-ISSUE.md` 的结案更正）。

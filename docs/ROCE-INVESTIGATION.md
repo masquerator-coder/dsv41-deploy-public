@@ -1,3 +1,15 @@
+> ## ⚠️ 结论更正（2026-09-19）：本文全部结论已作废
+>
+> 本文的"RoCE 走不通 / 三角拓扑下 NCCL 无解"是在**三重问题叠加**下得出的：
+> ① **接线错误**（有两根缆接在同一端口索引上，NCCL 按索引配对必然配到不在同一根缆上的两个口）；
+> ② **内核 `7.0.0-1019-nvidia` 的 CMA 回归**（`grep CmaTotal /proc/meminfo` = `0 kB` → `ibv_reg_mr_iova2` 报 ENOMEM，连 1 KB 区域都失败）；
+> ③ **引擎镜像 `/etc/nccl.conf` 残留** `NCCL_IB_USE_INLINE=1` + `NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS=1`（冻死 pynccl 的 4 字节 warmup）。
+>
+> 三条修正后，**同一套三角拓扑上 RoCE 一次通过**：fabric `all_reduce` 256 MB **13.86 GB/s**（32/32 信道 `via NET/IB`），
+> 引擎单流 **28.5–35.4 tok/s**、4 并发聚合 **67.5–75.8 tok/s**。
+> 正确方案见 **README §1–§4**；本文仅作**历史排查记录**保留，其中"哪些旋钮是负收益"仍然有效，
+> 但"无解 / 只能 socket / 需要加交换机"等结论**请勿再引用**。
+
 # RoCE 定位结论（2026-09-18，三节点 CX7 三角）
 
 ## 一句话

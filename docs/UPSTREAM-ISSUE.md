@@ -1,3 +1,21 @@
+> # 🔚 结案更正（2026-09-19）：不是 NCCL 的缺陷，我们自己的环境有三处问题
+>
+> 以下 issue 正文描述的"第二个 communicator 失败 / `p2p.cc` 内部错误"，最终定位**不在 NCCL**，
+> 而是我们现场的三处问题，全部修正后同一套三角拓扑上 RoCE 一次通过：
+>
+> 1. **接线错误**：有两根缆接在同一端口索引上（`p0↔p0`、`p1↔p1`），NCCL 按设备索引跨 rank 配对时
+>    必然配到"不在同一根缆上"的两个口；改成**每条缆 p0↔p1**（交叉环）即解。
+> 2. **内核 CMA 回归**：DGX OS `7.0.0-1019-nvidia` 上 `ibv_reg_mr_iova2` 必失败
+>    （`grep CmaTotal /proc/meminfo` = `0 kB`，正常内核 `131072 kB`）；换 `6.17.0-1031-nvidia`
+>    + 驱动 `580.173.02` 即解。
+> 3. **容器镜像 `/etc/nccl.conf` 残留**：`NCCL_IB_USE_INLINE=1` + `NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS=1`
+>    会让 SGLang 的 PyNccl 4 字节 warmup 永久冻死；置 0 即解。
+>
+> 结果：fabric `all_reduce` 256 MB **13.86 GB/s**（32/32 信道 `via NET/IB`），
+> 引擎单流 **28.5–35.4 tok/s**、4 并发聚合 **67.5–75.8 tok/s**。
+> 感谢贵仓库公开的 ring-only 补丁与构建记录——它们在错误配置阶段提供了关键对照，
+> 也**不需要**了（当前官方 2.30.7 原样即可跑通）。下方原文保留作为排查过程记录。
+
 ## 背景
 
 我们按 `patches/README.md` 的指引，把 **`v1-ring-only.patch` + `v4-netdev-hardcode.patch` + `stageB-tuner-two-band.patch` + `stageB-hardened-two-branch.patch`** 应用到官方 NCCL 2.30.7（`v2.30.7-1`）源码上，编译产物三机 md5 一致（`cd73d299887540559838202807e07b01`），并把补丁库用 **bind mount 覆盖镜像自带路径**（保证进程里只有一套 libnccl）。
