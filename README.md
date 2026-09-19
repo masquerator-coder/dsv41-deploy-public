@@ -199,6 +199,12 @@ scripts/                    可直接复用的脚本（链路、探针、基准�
                             apply_aicad_patches.py、patch_nccl_userorder.py、patch_smoke_*.py、
                             nccl-variant-matrix.sh、nccl_probe_matrix.py、probe-roce-gids.sh、
                             kernel-driver-switch.sh / -revert.sh（旧内核脚本）
+fleet/                      线上引擎侧**文件本体**快照（md5 与 head 逐字节一致，见 fleet/README.md）
+  start.sh                  head 上实际在跑的启动器（含 9 个透传 + NCCL_CROSS_NIC 默认 0）
+  boot.py                   容器入口（DSPARK_ALIGN_VERIFY_TO_TIER 守护，bind-mount 覆盖镜像内旧版）
+  Dockerfile                剥掉基础镜像残留的 /etc/nccl.conf（否则 pynccl warmup all_reduce 冻死）
+  files/nfs-share.sh        NFS 导出/挂载（mount-spec 修法；start.sh 以相对路径 source）
+  patch_dockerfile_ncclconf.py / patch_bootpy_align_optin.py   上述两处改动的生成器（可重放）
 assets/                     netplan 示例（node3 已按改线后地址更新）+ 已作废的 NCCL 拓扑文件
 env.example                 环境变量样例（已脱敏，RoCE 档 + socket 回退注释）
 ```
@@ -225,6 +231,9 @@ env.example                 环境变量样例（已脱敏，RoCE 档 + socket �
 ## 9. 许可与致谢
 
 - 本仓库文档与脚本：MIT（见 `LICENSE`）。
+- **例外**：`fleet/` 下的 4 个部署文件（`start.sh`、`boot.py`、`Dockerfile`、`files/nfs-share.sh`）派生自
+  [上游配方](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks)（AGPL-3.0-or-later），
+  在该目录内按 **AGPL-3.0-or-later** 分发；详见 `fleet/README.md`。
 - 不包含任何厂商源码或镜像内容；引用的第三方补丁请遵循其各自仓库的许可。
 - 感谢 `luxingcom/aicad-nccl-optimization` 与 LuZ 生产栈作者公开 ring-only 补丁与构建记录：
   它们在我们接线错误、内核有 CMA 回归的阶段提供了关键对照，也促成了最终定位
