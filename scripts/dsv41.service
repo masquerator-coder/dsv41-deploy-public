@@ -1,0 +1,22 @@
+[Unit]
+Description=DeepSeek-V4.1-Flash 3x DGX Spark service (share + serve + verify)
+Documentation=file:///home/fuqiang/dsv41-3xspark/DGX-Spark-三节点-DSV4.1部署记录.md
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=fuqiang
+WorkingDirectory=/home/fuqiang/dsv41-3xspark
+ExecStart=/home/fuqiang/dsv41-3xspark/svc-boot.sh
+ExecStop=/usr/bin/env bash -lc 'cd /home/fuqiang/dsv41-3xspark && ./svc.sh stop'
+TimeoutStartSec=2400
+TimeoutStopSec=900
+KillMode=none
+StandardOutput=append:/home/fuqiang/dsv41-3xspark/systemd-dsv41.log
+StandardError=append:/home/fuqiang/dsv41-3xspark/systemd-dsv41.log
+
+[Install]
+WantedBy=multi-user.target

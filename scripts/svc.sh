@@ -75,7 +75,7 @@ preflight() {
     out=$(node_do "$h" 'ls -1 /etc/nvidia/ 2>/dev/null | grep -qi cx7-hotplug-enabled && echo X=1 || echo X=0; \
       echo A=$(sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l); \
       echo U=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader 2>/dev/null | head -1 | tr -d " "); \
-      echo D=$(docker ps --format {{.Names}} 2>/dev/null | grep -c dsv41- || true)')
+      echo D=$(docker ps --format {{.Names}} 2>/dev/null | grep -cE "^dsv41-(head|worker)$" || true)')
     get() { echo "$out" | sed -n "s/^$1=//p" | head -1; }
     [ "$(get X)" = "1" ] && bad "$h: /etc/nvidia/cx7-hotplug-enabled 存在（必须移走）" || ok "$h: 无 cx7 hotplug 文件"
     if [ "$(get D)" != "0" ]; then
@@ -202,9 +202,9 @@ cmd_stop() {
   sleep 5
   local left=0 h s a
   for h in "${NODES[@]}"; do
-    s=$(node_do "$h" 'docker ps --format {{.Names}} 2>/dev/null | grep dsv41 | tr "\n" " "')
+    s=$(node_do "$h" 'docker ps --format {{.Names}} 2>/dev/null | grep -E "^dsv41-(head|worker)$" | tr "\n" " "')
     a=$(node_do "$h" 'sudo nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l')
-    if [ -n "${s// /}" ]; then bad "$h 仍有容器：$s"; left=1; else ok "$h 无 dsv41-* 容器"; fi
+    if [ -n "${s// /}" ]; then bad "$h 仍有引擎容器：$s"; left=1; else ok "$h 无引擎容器（dsv41-head/worker）"; fi
     if [ "${a:-0}" = "0" ]; then ok "$h GPU 无计算进程"; else bad "$h 仍有 $a 个 GPU 计算进程"; left=1; fi
   done
   if [ "$left" = 1 ]; then

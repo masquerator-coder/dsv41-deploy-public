@@ -153,6 +153,8 @@ cp env.example .env            # 按需修改 IP/HCA/内存水位
 # 其余子命令：./svc.sh status（只读体检）｜stop｜restart｜preflight｜logs -f
 # 若不用脚本，手工等价步骤：
 #   ./start.sh share && (setsid nohup ./start.sh serve > serve-$(date +%m%d-%H%M).log 2>&1 &)
+# 开机自启（已启用）：systemd 单元 dsv41.service → scripts/svc-boot.sh
+#   systemctl status dsv41 ｜ sudo systemctl stop dsv41 ｜ sudo systemctl disable dsv41
 
 # 3) 三层验证（缺一不可）
 curl -s http://127.0.0.1:8888/health -w " %{http_code}\n"                     # 200
@@ -181,6 +183,10 @@ docs/ROCE-INVESTIGATION.md  历史排查记录（旧接线 / 坏内核 / 镜像�
 docs/UPSTREAM-ISSUE.md      提交给上游的 issue 全文 + 结案更正
 scripts/                    可直接复用的脚本（链路、探针、基准、内核切换）
   svc.sh                    服务启停与体检：preflight / start / stop / restart / status / logs
+  svc-boot.sh              开机自启包装（等 worker 就绪 → svc.sh start；被下面的 unit 调用）
+  dsv41.service            systemd 单元（放到 /etc/systemd/system/ 后 systemctl enable --now）
+  verify_extras.py         视觉分支 + 工具调用（tool_calls）验证
+  make_vision_test.py      生成自检用测试图（蓝方块 / 红圆 / 黑条）
 assets/                     netplan 示例
 env.example                 环境变量样例（已脱敏，RoCE 档）
 ```
@@ -201,7 +207,7 @@ env.example                 环境变量样例（已脱敏，RoCE 档）
 
 - SPS（投机解码吞吐表）在当前构建下无法生效（`compact` ragged-verify 启动即崩，三处 shape 不一致），
   当前用 `static`，表 inert；对并发 ≥2 的场景本可有收益；
-- 尚未验证：视觉分支（带图请求）、工具调用（DSML 标签带前导空格）、`swapoff -a`；
+- **已验证（2026-09-19）**：视觉分支（自造 256×256 测试图，蓝方块/红圆/黑条的颜色、形状、位置全对）、工具调用（返回标准 `tool_calls`，DSML 解析器工作）、三台 `swapoff -a`（`/etc/fstab` 已注释，重启不复活）；
 - 单流解码延迟仍有波动（0.9 s ↔ 18 s），已排除 GPU 降频（三台 2.1–2.3 GHz、节流位 0x0）与带宽瓶颈。
 
 ## 9. 许可与致谢
