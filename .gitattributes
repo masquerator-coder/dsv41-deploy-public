@@ -1,0 +1,7 @@
+# ── fleet/：head 上直接运行的副本，必须恒定 LF ────────────────────────────────
+# 这些文件是 scp 到 DGX（Linux）直接跑的。Windows 上 core.autocrlf=true 会把工作树
+# 里文本文件变成 CRLF，scp 过去后 bash 报 "$'\r': command not found"，systemd
+# 单元与 Dockerfile 也会因行尾出问题；Python 脚本则可能带进 '\r'。
+# 这里把 fleet/ 下所有文件钉成 LF：仓库内与任何平台检出后都是 LF。
+fleet/*   text eol=lf
+fleet/**  text eol=lf
