@@ -183,12 +183,24 @@ docs/ROCE-INVESTIGATION.md  历史排查记录（旧接线 / 坏内核 / 镜像�
 docs/UPSTREAM-ISSUE.md      提交给上游的 issue 全文 + 结案更正
 scripts/                    可直接复用的脚本（链路、探针、基准、内核切换）
   svc.sh                    服务启停与体检：preflight / start / stop / restart / status / logs
-  svc-boot.sh              开机自启包装（等 worker 就绪 → svc.sh start；被下面的 unit 调用）
-  dsv41.service            systemd 单元（放到 /etc/systemd/system/ 后 systemctl enable --now）
-  verify_extras.py         视觉分支 + 工具调用（tool_calls）验证
-  make_vision_test.py      生成自检用测试图（蓝方块 / 红圆 / 黑条）
-assets/                     netplan 示例
-env.example                 环境变量样例（已脱敏，RoCE 档）
+  svc-boot.sh               开机自启包装（等 worker 就绪 → svc.sh start；被下面的 unit 调用）
+  dsv41.service             systemd 单元（放到 /etc/systemd/system/ 后 systemctl enable --now）
+  run_probe.sh              + pynccl_probe3.py：多 communicator 复现探针驱动/探针（**必须用引擎镜像跑**，1.5 分钟一轮）
+  kernel_switch2.sh         内核/驱动配对切换（6.17.0-1031 + 580.173.02，带回滚包缓存）
+  patch_startsh_envvar.py   给 start.sh 补环境变量透传（head + worker 两处）
+  ping_matrix.sh            接线验证：逐口源地址 ping 矩阵（判定哪两个口同缆）
+  arp_probe.py              L2 ARP 探针：反推"对端物理口插在本机哪个口"（不依赖 IP 规划）
+  verify_extras.py          视觉分支 + 工具调用（tool_calls）验证
+  make_vision_test.py       生成自检用测试图（蓝方块 / 红圆 / 黑条）
+  bench_decode.py / bench_prefill.py / bench_concurrency.py   单流 / 预填 / 并发基准
+  fabric-mtu-route.sh       MTU 9000 + /32 直连路由（用 netplan 持久化）
+  gpu_burn.py               GPU 烧机自检（排除降频锁死）
+  __legacy__/               已作废排查路线的证据，保留备查（**不要照做**）：
+                            apply_aicad_patches.py、patch_nccl_userorder.py、patch_smoke_*.py、
+                            nccl-variant-matrix.sh、nccl_probe_matrix.py、probe-roce-gids.sh、
+                            kernel-driver-switch.sh / -revert.sh（旧内核脚本）
+assets/                     netplan 示例（node3 已按改线后地址更新）+ 已作废的 NCCL 拓扑文件
+env.example                 环境变量样例（已脱敏，RoCE 档 + socket 回退注释）
 ```
 
 ## 7. 硬件/软件基线（实测环境）
