@@ -17,6 +17,19 @@
 **已在 `scripts/` 里且与 head 内容一致**（无需重复存档）：`svc.sh`、`svc-boot.sh`、`dsv41.service`、
 `patch_startsh_envvar.py`（生成 `start.sh` 的透传改动）。
 
+## `fleet/adapter/` — 引擎侧 adapter 快照（2026-09-25 新增）
+
+`adapter/` 此前**完全不在版本控制里**（只在 head 上），是漂移风险最大的一块。
+2026-09-25 把 head 上实际在跑的 16 个源文件全部归档（LF 归一，与 head 逐字节内容一致）：
+
+| 来源 | 文件 | 说明 |
+|---|---|---|
+| 上游 `main`（**未改**） | `encoding_compat.py`、`engram_backend.py`、`loop_abort.py`、`mxfp8_b12x.py`、`prefill_empty_cache.py`、`row_store.cpp`、`tp3_pad.py` | 7 个；其中 Engram row-store 系源自 0xSero（MIT 声明见 `LICENSE.upstream-MIT`） |
+| `knapcio` 经上游 `tp3-overnight-decode`（**未改**） | `autotune_keep.py`、`block_verify.py`、`draft_head_fp8.py`、`draft_tau.py`、`engram_prefetch.py`、`folded_result_fence.py`、`verify_cap.py` | 7 个；AGPL-3.0-or-later |
+| **本地修改** | `sitecustomize.py`（新增 8 个 env 门控 hook，纯增补）、`wo_a_w8.py`（einsum bridge 补 `**kw` 透传） | 2 个；改动原因见 `NOTICE` 与 `docs/BATCH-MIGRATION-2026-09-25.md` |
+
+> `librow_store.so` 是 `row_store.cpp` 的构建产物，**不入库**（`Dockerfile` 里现编译）。
+
 ## 来源（provenance）
 
 - 快照时间：2026-09-19T20:03+08:00；节点 `fq-dgx-01`；内核 `6.17.0-1031-nvidia`。
@@ -35,6 +48,16 @@
 
 ## 许可
 
-`fleet/` 下 4 个部署文件（`start.sh`、`boot.py`、`Dockerfile`、`files/nfs-share.sh`）派生自上述
-**AGPL-3.0-or-later** 上游配方，在该目录内按 AGPL-3.0-or-later 分发（对应源码见上游仓库同一提交）；
-本目录其余脚本与本仓库其它内容同为 MIT。
+`fleet/` 下派生自上游配方的文件 —— 4 个部署文件（`start.sh`、`boot.py`、`Dockerfile`、
+`files/nfs-share.sh`）与 **`adapter/` 下全部 16 个源文件** —— 按 **AGPL-3.0-or-later** 分发，
+全文见仓库根的 `LICENSE.AGPL`；第三方署名与本地改动声明见仓库根的 `NOTICE`。
+
+**对应源码即本目录所存文件本身**（含本地对 `adapter/sitecustomize.py` 与
+`adapter/wo_a_w8.py` 的修改），不是"见上游某提交"——本目录就是那一版的源码。
+
+`fleet/adapter/` 中另有 8 个文件源自 `knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4`
+（AGPL-3.0-or-later），经上游转述；`LICENSE.upstream-MIT` 保留的 0xSero MIT 声明
+必须随本仓库一并保留。
+
+本目录下的运维脚本（`svc.sh`、`svc-boot.sh`、`dsv41.service`）与 3 个补丁生成器为本仓库原创，
+与本仓库其它内容同为 MIT。

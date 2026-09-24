@@ -231,10 +231,14 @@ env.example                 环境变量样例（已脱敏，RoCE 档 + socket �
 ## 9. 许可与致谢
 
 - 本仓库文档与脚本：MIT（见 `LICENSE`）。
-- **例外**：`fleet/` 下的 4 个部署文件（`start.sh`、`boot.py`、`Dockerfile`、`files/nfs-share.sh`）派生自
+- **例外**：`fleet/` 下派生自上游配方的文件 —— 4 个部署文件（`start.sh`、`boot.py`、`Dockerfile`、
+  `files/nfs-share.sh`）与 `fleet/adapter/` 下 16 个源文件 —— 派生自
   [上游配方](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks)（AGPL-3.0-or-later），
-  在该目录内按 **AGPL-3.0-or-later** 分发；详见 `fleet/README.md`。
-- 不包含任何厂商源码或镜像内容；引用的第三方补丁请遵循其各自仓库的许可。
+  在该目录内按 **AGPL-3.0-or-later** 分发，全文见 `LICENSE.AGPL`。
+  其中 8 个解码 adapter 源自 `knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4`（AGPL-3.0-or-later）；
+  `LICENSE.upstream-MIT` 保留的 0xSero MIT 声明必须随本仓库一并保留。
+  第三方署名与**本地改动声明**见 `NOTICE`；详见 `fleet/README.md`。
+- 不包含任何厂商源码、模型权重或镜像内容；引用的第三方补丁请遵循其各自仓库的许可。
 - 感谢 `luxingcom/aicad-nccl-optimization` 与 LuZ 生产栈作者公开 ring-only 补丁与构建记录：
   它们在我们接线错误、内核有 CMA 回归的阶段提供了关键对照，也促成了最终定位
   （结论见 `docs/UPSTREAM-ISSUE.md` 的结案更正）。

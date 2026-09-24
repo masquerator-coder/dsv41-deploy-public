@@ -1,0 +1,79 @@
+DeepSeek-V4.1-Flash · 3× DGX Spark 部署记录（dsv41-deploy-public）
+=============================================================================
+
+本仓库的许可分布
+----------------
+
+1) 本仓库自身内容（docs/、scripts/、assets/、README 等）
+   MIT License —— 见 LICENSE。Copyright (c) 2026 masquerator-coder。
+
+2) fleet/ 目录（含 fleet/adapter/）
+   GNU Affero General Public License v3.0 or later（AGPL-3.0-or-later）——
+   全文见 LICENSE.AGPL。该目录下的文件派生自上游配方，按 AGPL 分发。
+
+3) LICENSE.upstream-MIT 所保留的 MIT 声明必须随本仓库一并保留（见下）。
+
+
+第三方组件与署名
+----------------
+
+· recipe skeleton（boot.py、benchmarks/、tests/、Engram row-store 的设计、Docker 布局）
+  源自 0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000
+  MIT License, Copyright (c) 2026 0xSero
+  → 按该许可要求，MIT 声明保留在 LICENSE.upstream-MIT；组合作品以 AGPL-3.0-or-later 提供。
+
+· 上游配方
+  MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks —— AGPL-3.0-or-later，Copyright (C) 2026 zurih
+  → 本仓库 fleet/ 下的部署文件与 fleet/adapter/ 的绝大部分内容取自该仓库。
+    取用基线见 fleet/README.md「来源（provenance）」；解码栈部分取自其分支
+    origin/tp3-overnight-decode（tip 97c46ac）。
+
+· fleet/adapter/ 中源自 knapcio 的 8 个解码优化 adapter
+  knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4（commit 4d8f4c0）—— AGPL-3.0-or-later：
+      autotune_keep.py   block_verify.py     draft_head_fp8.py   draft_tau.py
+      engram_prefetch.py folded_result_fence.py  verify_cap.py    wo_a_w8.py
+  → 经上游 MiaAI-Lab 转述；该仓库的 NOTICE 亦作同样署名。
+
+· 推理引擎 SGLang / FlashInfer / DeepGEMM / PyTorch 及 NVIDIA 组件
+  各自保留其上游许可。本仓库不重新分发引擎源码，也不分发模型权重。
+
+
+本仓库相对上游对 AGPL 部分所做的修改
+------------------------------------
+
+为满足 AGPL-3.0 第 6 条（Corresponding Source），在此声明 fleet/ 与
+fleet/adapter/ 相对上游的改动。完整且权威的对应源码即本仓库所存文件本身。
+
+fleet/ 部署文件（4 个）：
+  · start.sh           旧式 inline 参数表；新增 12 个 DSV41_* 透传；
+                       NCCL_CROSS_NIC 默认 0
+  · boot.py            DSPARK_ALIGN_VERIFY_TO_TIER 由无条件改为可选 opt-in
+  · Dockerfile         剥离基础镜像自带的 /etc/nccl.conf
+                       （NCCL_IB_USE_INLINE / NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS）
+  · files/nfs-share.sh mount-spec 修法（与上游的 NFS 加固是两套互补修法）
+  · 另新增：svc.sh / svc-boot.sh / dsv41.service 及 3 个补丁生成器（本仓库原创，MIT）
+
+fleet/adapter/（16 个源文件）：
+  · sitecustomize.py —— 本地修改。增加 8 个 env 门控 hook，分别对应
+      autotune_keep / engram_prefetch / verify_cap / block_verify / draft_tau /
+      folded_result_fence / wo_a_w8 / draft_head_fp8；完整保留上游原有的
+      engram_backend / mxfp8_b12x / prefill_empty_cache / encoding_compat /
+      loop_abort / tp3_pad / PagedIndexerMetadata 全部逻辑（纯增补，无删除）。
+  · wo_a_w8.py —— 本地修改。在 einsum bridge 的 _apply 上补 **kw 透传：
+      本 fleet 的引擎构建（da64c5cbb）会额外传 is_target_verify 与
+      fuse_mxfp8_quant，而针对 37939c26 写的上游签名不接收，导致 FlashInfer
+      autotune warm-up 抛 TypeError、引擎无法就绪。
+  · 其余 14 个文件与上游对应版本逐字节一致（其中 7 个同于上游 main，
+    7 个同于 origin/tp3-overnight-decode）。
+
+
+对应源码的获取
+--------------
+
+本仓库即 AGPL 部分的 Corresponding Source。上游原始版本见：
+
+  https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks
+  https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4
+  https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000
+
+本仓库不包含任何厂商源码、模型权重或容器镜像内容。
