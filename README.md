@@ -2,9 +2,11 @@
 
 三台 DGX Spark（GB10）用 CX7 直连成**三角**拓扑，跑起 DeepSeek-V4.1-Flash 推理服务。
 
-**结论先行（2026-09-19 更新）**：这套三角拓扑上 **NCCL 的 IB/RoCE 路径可用**，实测
-单流 **28.5–35.4 tok/s**、4 并发聚合 **67.5–75.8 tok/s**、预填 **≈3.0k tok/s**、fabric
-`all_reduce` 256 MB **13.86 GB/s**。
+**结论先行（2026-09-25 更新）**：这套三角拓扑上 **NCCL 的 IB/RoCE 路径可用**；再叠加解码栈
+优化（§4.1）后实测 **单流散文 ≈35 tok/s、单流代码 ≈79 tok/s、4 并发聚合 ≈75.5 tok/s**、
+预填 **≈2.0k tok/s**（唯一随机 prompt；`CHUNKED_PREFILL_SIZE=768`）、fabric
+`all_reduce` 256 MB **13.86 GB/s**。传输档的原始对照见 §4，升级细节见 §4.1 与
+[`docs/DEPLOY-RECORD-dsv41.md`](docs/DEPLOY-RECORD-dsv41.md)。
 
 > ⚠️ **本仓库早期版本（commit `3c7a016`）的结论"RoCE 走不通、只能 socket"是错的**——
 > 那是在**错误接线 + 有 CMA 回归的内核 + 引擎镜像里残留的 NCCL 开关**三重问题上得出的。
@@ -139,6 +141,33 @@ RoCE 50–100 µs。切到 RoCE 后单流 **+60~85%**、4 并发 **+75%**。
 \* socket 档预填为**重复 filler** 所测（可能被前缀缓存虚高）；要点：**预填是算力受限，RoCE 的增益主要在解码**，两档预填同量级。
 `scripts/bench_prefill.py` 已改为**每题唯一随机 prompt + 扣解码修正**（重复 prompt 会让预填虚高 1.5–2×，这是本文早前 "≈3.0k" 的错因）。
 
+### 4.1 2026-09-25 解码栈升级（迁移上游 TP3 overnight campaign）
+
+在 §4 的 RoCE 配置之上再叠一层解码优化（取自上游 `origin/tp3-overnight-decode`）：
+`EP_SIZE=1`、`DSPARK_BLOCK_SIZE=5` + `DSV41_VERIFY_CAP=conf:0.1` + `DSV41_BLOCK_VERIFY=1`、
+`wo_a` fp8 twin（`WO_A_W8` + `MID` + `DROP`）、`DSV41_DRAFT_HEAD_FP8=1`、
+`DSV41_AUTOTUNE_KEEP=1`、`DSV41_ENGRAM_PREFETCH=1`。
+
+> ⚠️ **口径变了，别和 §4 相减。** 本节用 `scripts/bench_migration.py`（**每请求唯一 prompt**，
+> 与 §4 的 `bench_decode.py` 重复 prompt 口径不可比；同一配置下两者 C4 差约 5 %）。
+> 下表的"升级前"列是**同口径**重测的基线。
+
+| 指标 | 升级前（同口径） | 升级后 | 变化 |
+|---|---|---|---|
+| C1 单流散文 greedy | 30.84 | **34.99 tok/s** | **+13.5 %** |
+| C1 单流代码 greedy | 58.71 | **78.94 tok/s** | **+34.5 %** |
+| C1 单流散文 sampled | 29.59 | **33.80 tok/s** | **+14.2 %** |
+| C4 并发聚合 | 68.55 | **75.47 tok/s** | **+10.1 %** |
+| 预填 | chunk 1024：2154 tok/s | chunk 768：**2018 tok/s** | −6.3 %（换 OOM 余量） |
+
+质量门 6/6 无退化；`accept len` 2.5–3.05（未塌）；autotune cache 跨重启 `reused`；
+同一 greedy prompt 连跑 3 次输出 **sha256 完全一致**。
+代价与取舍：预填 −6.3 % 是换取长 prompt（~200k）的 OOM 余量——上游在该栈 + chunk 1024 下
+被 ~200k prompt 打爆并硬复位。**本集群尚未做长上下文压测**。
+
+完整记录：[`docs/BATCH-MIGRATION-2026-09-25.md`](docs/BATCH-MIGRATION-2026-09-25.md)（逐批证据、
+三个坑、未验证项）· [`docs/DEPLOY-RECORD-dsv41.md`](docs/DEPLOY-RECORD-dsv41.md)（现场主记录）。
+
 ## 5. 快速上手
 
 ```bash
@@ -177,7 +206,10 @@ python scripts/bench_decode.py --url http://127.0.0.1:8888
 ## 6. 仓库结构
 
 ```
+docs/DEPLOY-RECORD-dsv41.md 现场主记录（按时间追加的历轮实验日志；权威版，与 Obsidian 同步）
 docs/DEPLOY-GUIDE.md        完整部署手册（流程 + 踩坑；结论以本 README §1–§4 为准）
+docs/BATCH-MIGRATION-2026-09-25.md  2026-09-25 解码栈升级的实测记录（逐批证据 / 三个坑 / 未验证项）
+docs/ADAPTER-MIGRATION-PLAN.md      该升级的事前方案（兼容性核对、分批、回滚）
 docs/PITFALLS.md            避坑清单（按现象索引）
 docs/ROCE-INVESTIGATION.md  历史排查记录（旧接线 / 坏内核 / 镜像残留，已作废，见文首更正）
 docs/UPSTREAM-ISSUE.md      提交给上游的 issue 全文 + 结案更正
@@ -226,7 +258,13 @@ env.example                 环境变量样例（已脱敏，RoCE 档 + socket �
 - SPS（投机解码吞吐表）在当前构建下无法生效（`compact` ragged-verify 启动即崩，三处 shape 不一致），
   当前用 `static`，表 inert；对并发 ≥2 的场景本可有收益；
 - **已验证（2026-09-19）**：视觉分支（自造 256×256 测试图，蓝方块/红圆/黑条的颜色、形状、位置全对）、工具调用（返回标准 `tool_calls`，DSML 解析器工作）、三台 `swapoff -a`（`/etc/fstab` 已注释，重启不复活）；
-- 单流解码延迟仍有波动（0.9 s ↔ 18 s），已排除 GPU 降频（三台 2.1–2.3 GHz、节流位 0x0）与带宽瓶颈。
+- **单流解码延迟波动（0.9 s ↔ 18 s）：部分处理（2026-09-25）**。启用 `DSV41_AUTOTUNE_KEEP=1`
+  后 autotune 缓存跨重启 `reused`（此前每次启动都重新 tune，各 rank 可能落到不同 tactic），
+  且同一 greedy prompt 连跑 3 次输出 **sha256 完全一致**。**但当初那种秒级延迟抖动本身没有做
+  前后对照测量**，因此不能声称已消除。原排查结论（已排除 GPU 降频：三台 2.1–2.3 GHz、节流位 0x0、
+  以及带宽瓶颈）仍然成立。
+- **长上下文未压测**：`CHUNKED_PREFILL_SIZE=768` 的保护效果未验证。已知 ≤32k 安全；
+  上游在该解码栈 + chunk 1024 下被 ~200k prompt 打爆（`NV_ERR_NO_MEMORY`，主机挂死需硬复位）。
 
 ## 9. 许可与致谢
 

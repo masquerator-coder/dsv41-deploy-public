@@ -5,6 +5,12 @@
 > 修正后同一套三角拓扑上 RoCE 可用：单流 **28.5–35.4 tok/s**、4 并发 **67.5–75.8 tok/s**、
 > fabric `all_reduce` 256 MB **13.86 GB/s**。流程与踩坑主体仍适用，但**传输配置、性能数字、
 > 内核/驱动版本请按 README（`6.17.0-1031-nvidia` + `580.173.02`）**。下文 §200 起的 RoCE 章节已作废。
+>
+> **再更正（2026-09-25）**：解码栈已升级（`EP_SIZE=1` + `k=5`+置信度上限 + `wo_a` fp8 twin +
+> draft head + autotune/engram 复用），现行性能 **单流散文 ≈35 / 单流代码 ≈79 / C4 ≈75.5 tok/s**，
+> 预填 ≈2.0k（`CHUNKED_PREFILL_SIZE=768`）。**下文 §一「最终状态」表格（socket / 18–19 tok/s /
+> `RoCE ❌` / 500k 上下文）是 2026-09-18 的原文，已全面作废**，保留仅为存档。
+> 现行配置与数字见 README §4.1 与 [`DEPLOY-RECORD-dsv41.md`](DEPLOY-RECORD-dsv41.md)。
 
 # DGX Spark ×3 部署 DeepSeek-V4.1-Flash 操作手册（正确流程 + 踩坑记录）
 
