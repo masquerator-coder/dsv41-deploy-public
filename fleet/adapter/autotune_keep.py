@@ -28,7 +28,12 @@ _VOLATILE = ("DSV41_DRAFT_CAPTURE", "DSV41_DRAFT_CAPTURE_OUT", "DSV41_DRAFT_CAPT
              "DSV41_DRAFT_HEAD_FP8", "DSV41_ENGRAM_PREFETCH", "DSV41_ENGRAM_PREFETCH_CHECK",
              # set by the launcher to a fresh timestamp on every boot: fingerprinting it made every
              # sidecar stale, so nothing was ever reused on dev-dsv41 (seen on TP3 2026-09-24)
-             "SGLANG_RUN_ID", "DSV41_WO_A_W8_DRAFT")
+             "SGLANG_RUN_ID", "DSV41_WO_A_W8_DRAFT",
+             # indexer 2026-09-26: the dense prefill indexer is a DeepGEMM fp4 kernel
+             # plus a top-k, not a FlashInfer-tuned op, so toggling it must reuse the
+             # tactics; a flip that re-tunes makes any A/B over this switch meaningless
+             # (measured on TP3 2026-09-26: each flip logged "tuned and saved")
+             "DSV41_INDEXER_CHUNKED")
 
 
 def launch_fingerprint() -> str:
