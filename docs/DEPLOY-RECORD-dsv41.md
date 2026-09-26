@@ -531,10 +531,96 @@ TP3/EP3 + block=3 的完整失败链、align flag 证伪、#39257+#31016 之后�
 
 ---
 
+### 5.9 SPS/compact 的上游修复全景与复查触发条件（2026-09-25 查证，**只读，未动手**）
+
+§5.8 的结论是"维持 static 等上游修复"。本节把"等"的对象具体化：**查清上游到底有几个 PR 在修、
+修到哪一步、以及什么时候该回来重估**——避免这条线无限期搁置、也避免重复投入。
+
+**方法**：GitHub API 逐条查 issue/PR 状态（本机 `pwsh` 被工作区 ACL 拒绝、且无 DGX 硬件，未跑任何集群命令）。
+
+#### 结论先行
+
+1. **compact 的失败不是一个 bug，是四个独立缺陷叠加**，分属四个 PR，**全部 open，一个都没 merge**；
+2. 其中 **PR #40567 正是为本集群 §5.8 报告的问题而写**（09-19 我们反馈 → 09-21 该 PR 提交），
+   改动清单与我们的失败链逐条对应；
+3. 但该 PR **未在 GB10/TP3 上验证**，其吞吐数据来自 8×H20 TP8/EP8；
+4. **MiaAI-Lab 上游（我们的直接来源）没有碰 SPS**——同步 `origin/main` 拿不到修复。
+
+#### 四个缺陷与对应 PR
+
+| # | 缺陷（我们观测到的现象） | 修复 PR | 状态 |
+|---|---|---|---|
+| ① | capture slot 几何：`_ragged_capture_slots` 用 `min(num_tokens, max_bs)`，bs<max_bs 的档位多摊行（12 token 摊成 4 行而非 3 行） | [#39257](https://github.com/sgl-project/sglang/pull/39257) | **open**（2026-09-13 起未更新） |
+| ② | confidence head 用 checkpoint 内置 gamma，而非运行时 block-size | [#31016](https://github.com/sgl-project/sglang/pull/31016) | **open**（2026-07-13 起） |
+| ③ | **变长 engram 哈希 + V4.1 token→request 映射**（= §5.8 第 5 层，我们卡住的地方） | [#40567](https://github.com/sgl-project/sglang/pull/40567) | **open**（见下节） |
+| ④ | TP rank 间 verify budget / graph-tier 不一致（同一步各 rank 选不同图，形状不匹配→挂起） | [#31195](https://github.com/sgl-project/sglang/pull/31195) | **open**；已在 B300 TP8 独立验证 120/120 |
+| — | c128 prefill plan kernel 竞态（`plan_compress_prefill_kernel0` 缺 `__syncthreads`） | [#32467](https://github.com/sgl-project/sglang/pull/32467) | ✅ **已合并**（2026-08-12） |
+
+> ①②③④ 全 open ⇒ **§5.8「维持 static、不改本地源码」的决定在当前时点依然正确**。
+
+#### PR #40567 与本集群的关系（本轮最重要的发现）
+
+2026-09-19 我们把复现数据贴到 issue #39173 后，上游 lidekang160122 **于 09-21 提交 PR #40567**
+`[DSV4.1][DSpark] Enable dynamic verify on PD decode`（17 files, +958/−32），并在 09-22 回复：
+
+> These changes target the **first-request Engram assertion and token_req_indices failure reported
+> after the capture geometry is corrected**.
+
+对照本记录 §5.8 第 5 层的原文（`engram.py:296` 断言 + `dsv41_sparse.token_req_indices` 的
+`repeat_interleave`），**逐一命中**——即这份复现报告直接推动了该修复。改动映射：
+
+| PR #40567 的改动 | 对应的我们的失败点 |
+|---|---|
+| Support packed Engram verification in Triton + torch fallback（含空行与 graph padding） | `engram.py:296` 断言 |
+| Resolve V4.1 token-to-request mappings from ragged offsets | `repeat_interleave: Invalid output_size` |
+| Broadcast host verify budget from TP rank 0 | = 缺陷 ④（#31195） |
+
+**保留意见（决定不跟进的理由）**：
+
+- 该 PR 作者自己的 checklist 两条**未打勾**：`Complete full-model PD integration validation`、
+  `Rerun full-model speed and profiling on the rebased PR revision`；
+- 验证环境是 **8×H20 TP8/EP8 + Mooncake RDMA**，非 GB10；
+- 其吞吐数据（static→dynamic compact：B16 +22.23% / B32 +26.75% / B64 +37.75%；逻辑 verify 行数
+  −32.7%~−36.2%）是 **H20 单机 decode 实例**的数字，**不可外推到 3×Spark TP3**；
+- 它是 **PD（prefill/decode 分离）**场景的功能 PR，**我们不是 PD 部署**（单 head + 2 worker 同构 TP3）
+  —— 这是最大的不确定性。
+
+#### MiaAI-Lab 上游没有 SPS 修复
+
+查其完整提交历史：2026-09-24 的 `tp3-overnight-decode`（PR #29，核心 `5f7de1c`）是解码栈升级
+（`EP_SIZE=1`、`wo_a` fp8 twin、`k=5`+confidence cap、draft head fp8、Engram prefetch），
+**完全不含 SPS/compact 修复**。同日 `5757d1b` 把基础镜像按 digest 钉死（`dev-dsv41` tag 已漂移）。
+⇒ **同步上游最新 `origin/main` 不会带来 SPS 修复。**
+
+#### 复查触发条件（满足任一即回来重估）
+
+1. #40567 或 #39257 状态变为 `merged`；
+2. #40567 新增 commit 中出现 **GB10 / DGX Spark** 验证数据；
+3. issue #39173 被关闭；
+4. 本集群出现**并发 ≥2 为主**的负载需求（SPS 收益只在并发档，见 §5.2/§5.4 的结论）。
+
+#### 若真要动手（选项 B，成本与风险）
+
+沿用 §5.8 已有的成熟手法即可，无需重新摸索：
+
+- **落地方式**：`git fetch` 取 #40567 的 diff → **bind-mount 覆盖镜像内文件**（三台都要挂，
+  各 rank verify 形状必须一致，否则 TP 集合通信会挂）；复现物料见 §5.8「复现 / 回滚物料」表；
+- **验证判据**：启动日志四条（`Capture target verify CUDA graph end`、`Capture draft verify CUDA graph end`、
+  `DSpark draft proposal … folded into the draft cuda graph`、`Warm-up done`），
+  然后**首个请求**——这才是 #40567 真正要修的地方，看 `engram.py:296` 是否还炸；
+- **回滚**：`start.sh.bak-bootmount-1151`（无任何挂载的原始版，当前线上用的就是它）。
+
+> **本节建议：选"等"（选项 A）**，除非恰有集群空闲窗口。理由是经济性——§5.2 已实测
+> **集合通信只占每步约 5%**，而 SPS 收益要并发 ≥2 才显现；而 ③ 是刚出炉的大改动（+958 行）、
+> 作者自认 validation 未完成、且目标场景（PD）与我们的拓扑不同，**首次在 GB10 上跑通的风险与
+> 15 分钟/轮的调试成本都不低**。
+
+---
+
 ## 附：现场文档（head `~/dsv41-3xspark/`）
 **`svc.sh`（服务启停与体检，见 §三：status / start / stop / restart / preflight / logs）**· `serve-*.log`（各轮 boot 日志）· `pynccl_probe3.py` + `run_probe.sh`（1.5 分钟多 communicator 复现探针，**必须用引擎镜像**跑）· `nccl_smoke.sh`（fabric 冒烟；注意其自带判据是坏的，只看 `Using network IB` / `via NET/IB` / busbw）· `bench_decode.py` / `bench_conc.py` / `bench_prefill.py`（吞吐；预填要用非流式 usage 口径）· `kernel_switch2.sh`（内核/驱动切换，含回滚包缓存）· `patch_startsh_envvar.py`（补环境变量透传）· `.env.*`（各档快照：`ib-reach-20260918` / `socket-fallback-20260919`；**09-25 升级轮的备份链在 `state/env.before-*`**）。
 
-**2026-09-25 升级轮新增的工具**（在仓库 `dsv41-deploy-public`，不在 head）：
+**2026-09-25 升级轮新增的工具**（在仓库 `DeepSeek-v4.1-Flash-DGX-Sparks-TP3`，不在 head）：
 
 | 工具 | 位置 | 用途 |
 |---|---|---|
@@ -727,10 +813,15 @@ rm -f ~/.cache/sglang/flashinfer/autotune/*/sm121/*/rank_*.{json,launch}
   未做逐 token 数值对照（上游对 DROP 的说明本就是 "dequantized copy not bit-identical"）。
 - 上游剩余大头：b12x dense MXFP8 GEMM **17.4 ms/step**、MoE grouped GEMM **21.1 ms/step**、
   SPS/STS 表（主要在并发 ≥2）、k=4 + cap。§5.6 的 SPS 结论仍待重估。
-- 仓库侧：`adapter/` 已纳入 `dsv41-deploy-public` 的 `fleet/adapter/`（16 个源文件，
-  含 AGPL-3.0 合规文件 `LICENSE.AGPL` / `NOTICE` / `LICENSE.upstream-MIT`），
+- 仓库侧：`adapter/` 已纳入 `DeepSeek-v4.1-Flash-DGX-Sparks-TP3` 的 `fleet/adapter/`
+  （源文件数见 `fleet/README.md` 现状：2026-09-26 起为 **17 个**，含 `indexer_chunked.py`；
+  另有 AGPL-3.0 合规文件 `LICENSE.AGPL` / `NOTICE` / `LICENSE.upstream-MIT`），
   提交 `fbbf547` + `e0b507e`。`librow_store.so` 是构建产物未入库。
-- 服务侧 adapter 仍是 `scp` 手工同步，**重启不会自动从仓库同步**。
+- 服务侧 adapter（**2026-09-26 更正**）：早前记的"仍是 `scp` 手工同步，重启不会自动从仓库同步"
+  不准确——adapter 是 **`COPY` 进镜像**的（`fleet/Dockerfile:5`），所以改完 adapter 后
+  **必须 `./start.sh build` 重建镜像**；**只重启服务是静默无效的**（容器内仍是旧代码，
+  而 `start.sh` 传的 env 照常生效）。详见 `fleet/README.md` 与
+  `docs/INDEXER-CHUNKED-TP3-RESULTS.md` §1。
 
 完整记录另见仓库 `docs/BATCH-MIGRATION-2026-09-25.md`（含逐批证据、未验证项）
 与 `docs/ADAPTER-MIGRATION-PLAN.md`（事前方案）。

@@ -1,39 +1,50 @@
-# 3× DGX Spark 部署 DeepSeek-V4.1-Flash（TP=3 跨三机）· RoCE 方案
+# 3× DGX Spark 部署 DeepSeek-V4.1-Flash（TP=3）· RoCE
 
-三台 DGX Spark（GB10）用 CX7 直连成**三角**拓扑，跑起 DeepSeek-V4.1-Flash 推理服务。
+三台 DGX Spark（GB10）用 CX7 直连成**三角**拓扑，跑 DeepSeek-V4.1-Flash 推理服务
+（`max_model_len=262144`、`max_total_num_tokens=750000`）。
 
-**结论先行（2026-09-25 更新）**：这套三角拓扑上 **NCCL 的 IB/RoCE 路径可用**；再叠加解码栈
-优化（§4.1）后实测 **单流散文 ≈35 tok/s、单流代码 ≈79 tok/s、4 并发聚合 ≈75.5 tok/s**、
-预填 **≈2.0k tok/s**（唯一随机 prompt；`CHUNKED_PREFILL_SIZE=768`）、fabric
-`all_reduce` 256 MB **13.86 GB/s**。传输档的原始对照见 §4，升级细节见 §4.1 与
-[`docs/DEPLOY-RECORD-dsv41.md`](docs/DEPLOY-RECORD-dsv41.md)。
+## 当前状态（2026-09-26 实测）
 
-> ⚠️ **本仓库早期版本（commit `3c7a016`）的结论"RoCE 走不通、只能 socket"是错的**——
-> 那是在**错误接线 + 有 CMA 回归的内核 + 引擎镜像里残留的 NCCL 开关**三重问题上得出的。
-> 三条都修正后一次通过。旧记录里"九条路线实测"的价值只剩"哪些旋钮是负收益"，
-> 请以本文为准；`docs/ROCE-INVESTIGATION.md` 已标注为**历史记录（已作废）**。
+配置：`EP_SIZE=1` · `CHUNKED_PREFILL_SIZE=1024` · `MEM_FRACTION_STATIC=0.95` · `NCCL_NET=IB`
+
+| 指标 | 实测值 |
+|---|---|
+| 单流散文 greedy / sampled | **33.6 / 35.3 tok/s** |
+| 单流代码 greedy | **79.3 tok/s** |
+| 4 并发聚合 | **76.5 tok/s** |
+| 预填（≈4k 档，扣解码） | **2223 tok/s**（7k–30k 区间约 2260）|
+| 预填 @ ~200k / @ 255k token | **1840 / 1609 tok/s** |
+| 长上下文可用上限 | **254,811 token 实测通过**（262144 的 97%）|
+| fabric `all_reduce` 256 MB | 13.86 GB/s |
+| 三台容器 | healthy · `via NET/IB` 64 条 · `reg_mr` 失败 0 |
+
+**报数必带口径**（三条都会显著影响数字）：
+
+1. **单流 decode 速度强依赖内容**：数数字这类高可预测内容可到 **87 tok/s**，散文只有 **34** ——
+   差异来自投机解码接受率，不是系统变慢。**不写负载类型的吞吐数没有意义。**
+2. 非流式 `usage.completion_tokens ÷ 整请求 wall`，**每请求唯一 prompt**（重复 prompt 会被 radix
+   前缀复用，预填虚高 1.5–2×）；预填数**已扣解码时间**。
+3. **运行间噪声约 ±3–4%**（用"代码路径逐字节等价"的对照臂实测得出）。
+   小于 4% 的差异不是真实变化；单流离散最大（±9%），C4 最稳（±0.8%）。
 
 ---
 
-## 1. 接线：这是能不能走 RoCE 的第一决定因素
+## 1. 接线（第一决定因素）
 
 ```
-        正确（交叉环）                          错误（会 110 / 静默死）
-        W1: n1.p0 ↔ n3.p1                      W1: n1.p0 ↔ n3.p0
-        W2: n1.p1 ↔ n2.p0                      W2: n1.p1 ↔ n2.p0
-        W3: n2.p1 ↔ n3.p0                      W3: n2.p1 ↔ n3.p1
+        正确（交叉环）                        错误（会 110 / 静默死）
+        W1: n1.p0 ↔ n3.p1                    W1: n1.p0 ↔ n3.p0
+        W2: n1.p1 ↔ n2.p0                    W2: n1.p1 ↔ n2.p0
+        W3: n2.p1 ↔ n3.p0                    W3: n2.p1 ↔ n3.p1
 ```
 
-**心智模型**：每台 Spark 的 2 个物理 QSFP 口会在**两个 PCI 域各暴露一个 netdev**
-（`phys_switch_id` 相同、`phys_port_name` 为 `p0/p1/p0/p1`），所以每台看起来有 4 个 RDMA 设备、
-4 个 fabric 地址、全网 6 个 `/24` —— **物理上只有 3 根线**，域 2 那批是同一根缆的第二层视图。
-**一个 `/24` 只属于一根缆**。
+**规则**：必须是**每条缆 p0↔p1**。每台的 2 个物理 QSFP 口会在**两个 PCI 域各暴露一个 netdev**，
+所以每台看起来有 4 个 RDMA 设备 / 4 个 fabric 地址 / 全网 6 个 `/24` —— **物理上只有 3 根线**，
+域 2 那批是同一根缆的第二层视图，**一个 `/24` 只属于一根缆**。
 
-**为什么必须是"每条缆 p0↔p1"**：NCCL 按 channel→NIC 的**设备索引**跨 rank 配对
-（`ncclTopoSearchCheckNet`，索引 0 = PCI 域最小的卡 = 三台都是 `p0`）。只要有两根缆接在**同一端口索引**上，
-就必然存在"被配到一起的两个口不在同一根缆上"的索引 → `ibv_modify_qp 110 Connection timed out`
-（重试 35 次后放弃），或表现为无 NCCL 告警的静默死。改成每条缆 **p0↔p1** 后，配合
-`NCCL_IB_SUBNET_AWARE_ROUTING=1`（接收侧按对端当前 GID 的同 `/24` 逐连接选本地口），NCCL 层一次通过。
+若有两根缆接在**同一端口索引**上，NCCL 按设备索引（索引 0 三台都是 `p0`）配对时必然把不同缆的
+两口配到一起 → `ibv_modify_qp 110 Connection timed out`，或**无任何 NCCL 告警的静默死**。
+诊断过程与踩坑见 [`docs/ROCE-INVESTIGATION.md`](docs/ROCE-INVESTIGATION.md)（历史记录）。
 
 现役地址表（实测）：
 
@@ -43,59 +54,44 @@
 | n2 | 10.100.180.1 | 10.100.176.2 | 10.100.181.1 | 10.100.177.2 |
 | n3 | 10.100.176.1 | 10.100.178.1 | 10.100.177.1 | 10.100.179.1 |
 
-> 从错误接线改成正确接线，本集群只动了 **n3 的两个 QSFP 插头**，并把 **n3 的四个 fabric IP 整体对调**
-> （`p0` 那对 ↔ `p1` 那对），`/32` 路由的 `dev` 跟着改。
+**每台必做**（netplan 示例见 `assets/`）：
 
-**每台必做的链路配置**（示例见 `assets/`）：
-
-1. 四个 fabric 口 **MTU 9000**；
-2. 为**每个对端**加 `/32` 直连路由，让流量走直连线而不是绕管理网；
-3. 以上两项**必须写进 netplan / NetworkManager**——临时 `ip route add` 会被 NM re-apply 冲掉，
+1. 四个 fabric 口 **MTU 9000**，并为**每个对端**加 `/32` 直连路由；
+2. 这两项**必须写进 netplan / NetworkManager** —— 临时 `ip route add` 会被 NM re-apply 冲掉，
    症状是到 fabric 的 TCP 停在 `SYN-SENT` 且**源地址是 WiFi**，引擎 init 永久挂起；
-4. **`/etc/nvidia/cx7-hotplug-enabled` 必须移走**（三台都查）：留着的话某台重启会把 ConnectX 口
-   从**邻居**的 PCI 总线上摘掉，fabric 局部静默消失。
+3. **`/etc/nvidia/cx7-hotplug-enabled` 必须移走**（三台都查）：留着的话某台重启会把 ConnectX 口
+   从**邻居**的 PCI 总线上摘掉，fabric 局部静默消失；
+4. **控制面走管理网**：`NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` = WiFi 口 `wlP9s9`。
+   设成 fabric 口会导致各 rank 公布互不可达的地址 → 永久 `SYN-SENT`、**NCCL 一行日志都不打**、
+   三台空转（诊断：`sudo ss -tnp | grep 10.100`）。
 
 ```bash
-# 应用网络改动（不要用 netplan apply，免得连带重置管理网 WiFi）
-sudo netplan generate && nmcli con reload && nmcli dev reapply <iface>
-```
+sudo netplan generate && nmcli con reload && nmcli dev reapply <iface>   # 不要用 netplan apply
 
-**接线验证（四件套）**：
-
-```bash
-# ① 四条 ConnectX function 都满速：期望 32.0 GT/s x4
+# 验证：① 四条 ConnectX 满速（期望 32.0 GT/s x4）
 for f in $(lspci -D -d 15b3: | awk '{print $1}'); do
   echo $f $(cat /sys/bus/pci/devices/$f/current_link_speed) x$(cat /sys/bus/pci/devices/$f/current_link_width); done
-# ② IB 口全 ACTIVE（某台离线时，1: DOWN / phys 3: Disabled 的口就是通往那台的缆）
+# ② 四个 IB 口全 4: ACTIVE
 for d in /sys/class/infiniband/*; do echo "$(basename $d) $(cat $d/ports/1/state)"; done
-# ③ 源口 ping（同缆通、异缆必须不通）
-ping -I enp1s0f0np0 10.100.178.1 && echo 同缆OK
+# ③ 严格判同缆用 L2 ARP 探针（ping -I 在有 /32 路由时会误判"通"）
+python3 scripts/arp_probe.py
 ```
 
-> ⚠️ 只靠 `ping -I` 判同缆**不可靠**：存在 `/32` 路由时，指定源地址的包仍按路由表选 `dev`，
-> 会对异缆地址"通"。严格判定请用 L2 ARP 探针（AF_PACKET，不带网段语义）。
-
-**控制面必须走管理网**：`NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` 用 WiFi 管理口 `wlP9s9`。
-它决定每个 rank 公布的 bootstrap 监听地址；设成 fabric 口时各节点公布自己那个口的 fabric IP，
-三角里这些 IP 两两不在同一根缆上、又无路由 → 内核改走默认路由 → 永久 `SYN-SENT`、
-**NCCL 一行日志都不打**、三台空转。诊断：`sudo ss -tnp | grep 10.100`。
-
-## 2. 另两条前提（同样致命，且都不在 NCCL 里）
+## 2. 另两条前提（都不在 NCCL 里，同样致命）
 
 | # | 问题 | 判据 | 修法 |
 |---|---|---|---|
-| ① | **内核 CMA 回归**：`7.0.0-1019-nvidia` 上 `ibv_reg_mr_iova2` 必然 `Cannot allocate memory`（连 **1 KB** 区域都失败，而此时节点有 9 GB 空闲）⇒ 引擎建后续 communicator 时 `ncclSystemError` | `grep CmaTotal /proc/meminfo` = **`0 kB`**（正常内核 `131072 kB`） | 内核/驱动配对切到 **`6.17.0-1031-nvidia` + `580.173.02`**；`GRUB_DEFAULT="1>2"` + `update-grub` + `apt-mark hold` 防自动升回 |
-| ② | **引擎镜像 `/etc/nccl.conf` 残留**：`NCCL_IB_USE_INLINE=1` + `NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS=1` ⇒ pynccl 的 **4 字节** warmup all_reduce 永久冻死，日志停在 `sglang is using nccl==2.30.7`，GPU 96% 但功耗仅 ~16 W（自旋） | `docker exec <容器> cat /etc/nccl.conf` | 给 `start.sh` 补透传并置 0：`patch_startsh_envvar.py NCCL_IB_USE_INLINE 0`、`... NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS 0`（进程 env 优先于 conf 文件） |
+| ① | **内核 CMA 回归**：`7.0.0-1019-nvidia` 上 `ibv_reg_mr_iova2` 必然 `Cannot allocate memory`（连 1 KB 都失败）⇒ 引擎建后续 communicator 时 `ncclSystemError` | `grep CmaTotal /proc/meminfo` = **`0 kB`**（正常 `131072 kB`） | 内核/驱动换到 **`6.17.0-1031-nvidia` + `580.173.02`**；`GRUB_DEFAULT="1>2"` + `update-grub` + `apt-mark hold` 防升回 |
+| ② | **引擎镜像 `/etc/nccl.conf` 残留**：`NCCL_IB_USE_INLINE=1` + `NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS=1` ⇒ pynccl 的 **4 字节** warmup all_reduce 永久冻死（日志停在 `sglang is using nccl==2.30.7`，GPU 96% 但功耗仅 ~16 W 自旋） | `docker exec <容器> cat /etc/nccl.conf` | `start.sh` 补透传并置 0：`patch_startsh_envvar.py NCCL_IB_USE_INLINE 0`、`... NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS 0`（**进程 env 优先于 conf 文件**）|
 
-> ② 之所以长期被误诊：所有"能通过"的独立 smoke / 探针跑的**都是基础镜像**（不带该文件），
-> 于是形成"单测能过、引擎卡死"的假矛盾。**复现必须用引擎镜像**跑探针。
-> 别被 memlock 误导：引擎容器带 `--ulimit memlock=-1:-1`；**裸 `docker run` 的容器内默认只有 8192**。
+> ② 的关键排查经验：所有"能通过"的独立 smoke/探针跑的**都是基础镜像**（不带该文件），
+> 于是形成"单测能过、引擎卡死"的假矛盾——**复现必须用引擎镜像**跑探针。
+> 另：引擎容器带 `--ulimit memlock=-1:-1`，**裸 `docker run` 的容器内默认只有 8192**，别被它误导。
 
 ## 3. 传输配置
 
-### 3.1 RoCE（推荐）
-
 ```bash
+# ── RoCE（现役）──
 NCCL_NET=IB
 NCCL_IB_DISABLE=0
 NCCL_IB_HCA=rocep1s0f0,rocep1s0f1      # 每台两个逻辑口 = 域0 的两个物理口
@@ -111,172 +107,129 @@ NCCL_SHM_DISABLE=1
 NCCL_MAX_NCHANNELS=8
 NCCL_BUFFSIZE=1048576
 NCCL_PROTO='^LL128'
-NCCL_DEBUG_SUBSYS=INIT,NET,ENV
 NCCL_HOST_DIR=/nonexistent-nccl-host-dir   # 禁挂自建 NCCL，用镜像自带
+
+# ── socket 回退（只在 RoCE 出问题时用；吞吐约为 RoCE 的 55%）──
+# NCCL_NET=Socket / NCCL_IB_DISABLE=1 / NCCL_SOCKET_IFNAME=enp1s0f0np0（数据面仍走 CX7 直连）
 ```
 
-### 3.2 socket 回退（RoCE 出问题时的一键退路）
+**瓶颈是延迟不是带宽**：每步约 104 次集合通信，socket 单次约 1 ms、RoCE 50–100 µs ——
+所以 RoCE 的增益主要在**解码**（单流 +60~85%、4 并发 +75%），预填两档同量级（预填是算力受限）。
 
-```bash
-NCCL_NET=Socket
-NCCL_IB_DISABLE=1
-NCCL_SOCKET_IFNAME=enp1s0f0np0          # 数据面仍走 CX7 直连线
-GLOO_SOCKET_IFNAME=wlP9s9
-```
-
-## 4. 实测性能（同机同配方，只换传输）
-
-| 指标 | **RoCE（当前）** | socket 回退 |
-|---|---|---|
-| 单流解码 | **28.5 / 29.8 / 33.8 tok/s** | 17.9 – 19.2 |
-| 4 并发聚合 | **67.5 / 75.6 / 75.7 / 75.8 tok/s** | 39.7 – 43.3 |
-| 预填 | **2.0–2.1k tok/s**（唯一随机 prompt，≈4k 档均值 2045） | ~2.0k\* |
-| fabric `all_reduce` 256 MB | **13.86 GB/s**（1 MB 8.1 / 16 MB 13.2） | 2.07 – 2.14 GB/s |
-| 模型服务 | `max_model_len=262144`、`max_total_num_tokens=499968` | 同 |
-
-**为什么差这么多**：瓶颈不是带宽，而是**每一步约 104 次集合通信的延迟**——socket 单次约 1 ms、
-RoCE 50–100 µs。切到 RoCE 后单流 **+60~85%**、4 并发 **+75%**。
-（并发档仍略低于社区同配方参考 78.6 tok/s，剩余空间在 SPS 表与 batch 档位。）
-
-\* socket 档预填为**重复 filler** 所测（可能被前缀缓存虚高）；要点：**预填是算力受限，RoCE 的增益主要在解码**，两档预填同量级。
-`scripts/bench_prefill.py` 已改为**每题唯一随机 prompt + 扣解码修正**（重复 prompt 会让预填虚高 1.5–2×，这是本文早前 "≈3.0k" 的错因）。
-
-### 4.1 2026-09-25 解码栈升级（迁移上游 TP3 overnight campaign）
-
-在 §4 的 RoCE 配置之上再叠一层解码优化（取自上游 `origin/tp3-overnight-decode`）：
-`EP_SIZE=1`、`DSPARK_BLOCK_SIZE=5` + `DSV41_VERIFY_CAP=conf:0.1` + `DSV41_BLOCK_VERIFY=1`、
-`wo_a` fp8 twin（`WO_A_W8` + `MID` + `DROP`）、`DSV41_DRAFT_HEAD_FP8=1`、
-`DSV41_AUTOTUNE_KEEP=1`、`DSV41_ENGRAM_PREFETCH=1`。
-
-> ⚠️ **口径变了，别和 §4 相减。** 本节用 `scripts/bench_migration.py`（**每请求唯一 prompt**，
-> 与 §4 的 `bench_decode.py` 重复 prompt 口径不可比；同一配置下两者 C4 差约 5 %）。
-> 下表的"升级前"列是**同口径**重测的基线。
-
-| 指标 | 升级前（同口径） | 升级后 | 变化 |
-|---|---|---|---|
-| C1 单流散文 greedy | 30.84 | **34.99 tok/s** | **+13.5 %** |
-| C1 单流代码 greedy | 58.71 | **78.94 tok/s** | **+34.5 %** |
-| C1 单流散文 sampled | 29.59 | **33.80 tok/s** | **+14.2 %** |
-| C4 并发聚合 | 68.55 | **75.47 tok/s** | **+10.1 %** |
-| 预填 | chunk 1024：2154 tok/s | chunk 768：**2018 tok/s** | −6.3 %（换 OOM 余量） |
-
-质量门 6/6 无退化；`accept len` 2.5–3.05（未塌）；autotune cache 跨重启 `reused`；
-同一 greedy prompt 连跑 3 次输出 **sha256 完全一致**。
-代价与取舍：预填 −6.3 % 是换取长 prompt（~200k）的 OOM 余量——上游在该栈 + chunk 1024 下
-被 ~200k prompt 打爆并硬复位。**本集群尚未做长上下文压测**。
-
-完整记录：[`docs/BATCH-MIGRATION-2026-09-25.md`](docs/BATCH-MIGRATION-2026-09-25.md)（逐批证据、
-三个坑、未验证项）· [`docs/DEPLOY-RECORD-dsv41.md`](docs/DEPLOY-RECORD-dsv41.md)（现场主记录）。
-
-## 5. 快速上手
+## 4. 快速上手
 
 ```bash
 # 0) 前置：内核/驱动配对（§2 ①）+ engine 侧两个开关（§2 ②）+ 接线与链路（§1）
 
-# 1) 链路：MTU 9000 + /32 直连路由（三台都执行，或用 assets/ 里的 netplan 持久化）
+# 1) 链路：MTU 9000 + /32 直连路由（三台都执行）
 sudo bash scripts/fabric-mtu-route.sh
 
-# 2) 起服务（在 head 上；svc.sh 会把预检/share/等就绪/三层验证串起来，约 13–15 分钟）
+# 2) 起服务（在 head 上）
 cp env.example .env            # 按需修改 IP/HCA/内存水位
 ./svc.sh start                 # 预检 → share → serve → 等就绪 → 三层验证
-# 其余子命令：./svc.sh status（只读体检）｜stop｜restart｜preflight｜logs -f
-# 若不用脚本，手工等价步骤：
-#   ./start.sh share && (setsid nohup ./start.sh serve > serve-$(date +%m%d-%H%M).log 2>&1 &)
-# 开机自启（已启用）：systemd 单元 dsv41.service → scripts/svc-boot.sh
-#   systemctl status dsv41 ｜ sudo systemctl stop dsv41 ｜ sudo systemctl disable dsv41
+#   本次实测就绪 497–617 s（约 8–10 分钟）；svc.sh 自带提示写 13–15 分钟，偏保守
+#   其余子命令：./svc.sh status（只读体检）｜stop｜restart｜preflight｜logs -f
+#   开机自启已启用：systemd 单元 dsv41.service → scripts/svc-boot.sh
 
 # 3) 三层验证（缺一不可）
-curl -s http://127.0.0.1:8888/health -w " %{http_code}\n"                     # 200
-docker ps --format "{{.Names}} {{.Status}}"                                    # 三台容器 healthy
-L=$(ls -t serve-*.log|head -1)                                                 # 传输归属
-grep -m2 -E "Using network|Assigned NET plugin" $L; grep -c "via NET/IB" $L; grep -c ibv_reg_mr_iova2 $L
-#   期望：Using network IB / Assigned NET plugin IB / via NET/IB ≈64 / reg_mr 失败 = 0
-python scripts/bench_decode.py --url http://127.0.0.1:8888
+curl -s http://127.0.0.1:8888/health -w " %{http_code}\n"                      # 200
+docker ps --format "{{.Names}} {{.Status}}"                                     # 三台 healthy
+L=$(ls -t serve-*.log|head -1); grep -c "via NET/IB" $L; grep -c ibv_reg_mr_iova2 $L   # ≈64 / 0
+python3 scripts/bench_migration.py http://192.168.0.86:8888 smoke . 3 300        # 从 worker 跑
 ```
 
-**运维铁律**（完整清单见 [`docs/PITFALLS.md`](docs/PITFALLS.md)）：
+## 5. 运维铁律
 
-1. **一轮失败后必须三台重启再开下一轮**——残留容器与挂起上下文会让下一轮在更早的地方假失败；
-2. 重启后**先 `./start.sh share` 再 `serve`**（否则 worker 的 NFS 检查静默卡十几分钟）；
-3. NFSv4 `fsid=0` 导出时，客户端必须挂**伪根 `:/`**，不是子目录；
-4. **绝不要 `docker ps -q | xargs docker rm -f`** —— 引擎容器也在列表里；
-5. `MEM_FRACTION_STATIC` 用 0.95（低于 0.944 会报 "weights leave no GPU memory for the KV cache"）；
-6. 新增 `.env` 变量必须补透传（`patch_startsh_envvar.py`），`bash -n` 查不出这类拼接错误。
+完整清单见 [`docs/PITFALLS.md`](docs/PITFALLS.md)。这几条**踩过且复现过**：
+
+1. **`adapter/` 是 `COPY` 进镜像的，不是 bind-mount** —— 改 `adapter/` 下任何文件（含
+   `sitecustomize.py`）**必须 `./start.sh build` 重建镜像**；**只重启服务是静默无效的**：
+   容器里仍是旧代码，而 `start.sh` 传的 env 照常生效，表现为"配置生效了、代码没生效"、
+   **没有任何报错**。详见 [`fleet/README.md`](fleet/README.md)。
+2. **`svc.sh stop` 有意保留 `dsv41-nfs`，而 `start.sh` 的 share 不幂等** —— stop 后直接 start
+   会在 `docker run --name dsv41-nfs` 处报 **container name 冲突**。两者之间先
+   `docker rm -f dsv41-nfs`（若因导出被占用而失败，重试几次）。
+3. **一轮失败后三台重启再开下一轮**——残留容器与挂起上下文会让下一轮在更早的地方假失败。
+4. 重启机器后**先 `./start.sh share` 再 `serve`**（否则 worker 的 NFS 检查静默卡十几分钟）。
+   注意开机自启的 `dsv41.service` 会**自动**做一次 share，此时再手工 start 就会撞上第 2 条。
+5. NFSv4 `fsid=0` 导出时，客户端必须挂**伪根 `:/`**，不是子目录。
+6. **绝不要 `docker ps -q | xargs docker rm -f`**——引擎容器也在列表里。
+7. `MEM_FRACTION_STATIC` 用 0.95（低于 0.944 会报 "weights leave no GPU memory for the KV cache"）。
+8. 新增 `.env` 变量**必须补透传**（`patch_startsh_envvar.py`）；`bash -n` 查不出拼接错误，
+   要实测 worker 行的 `-e` token 数并真实展开参数。
 
 ## 6. 仓库结构
 
 ```
-docs/DEPLOY-RECORD-dsv41.md 现场主记录（按时间追加的历轮实验日志；权威版，与 Obsidian 同步）
-docs/DEPLOY-GUIDE.md        完整部署手册（流程 + 踩坑；结论以本 README §1–§4 为准）
-docs/BATCH-MIGRATION-2026-09-25.md  2026-09-25 解码栈升级的实测记录（逐批证据 / 三个坑 / 未验证项）
-docs/ADAPTER-MIGRATION-PLAN.md      该升级的事前方案（兼容性核对、分批、回滚）
-docs/PITFALLS.md            避坑清单（按现象索引）
-docs/ROCE-INVESTIGATION.md  历史排查记录（旧接线 / 坏内核 / 镜像残留，已作废，见文首更正）
-docs/UPSTREAM-ISSUE.md      提交给上游的 issue 全文 + 结案更正
-scripts/                    可直接复用的脚本（链路、探针、基准、内核切换）
-  svc.sh                    服务启停与体检：preflight / start / stop / restart / status / logs
-  svc-boot.sh               开机自启包装（等 worker 就绪 → svc.sh start；被下面的 unit 调用）
-  dsv41.service             systemd 单元（放到 /etc/systemd/system/ 后 systemctl enable --now）
-  run_probe.sh              + pynccl_probe3.py：多 communicator 复现探针驱动/探针（**必须用引擎镜像跑**，1.5 分钟一轮）
-  kernel_switch2.sh         内核/驱动配对切换（6.17.0-1031 + 580.173.02，带回滚包缓存）
-  patch_startsh_envvar.py   给 start.sh 补环境变量透传（head + worker 两处）
-  ping_matrix.sh            接线验证：逐口源地址 ping 矩阵（判定哪两个口同缆）
-  arp_probe.py              L2 ARP 探针：反推"对端物理口插在本机哪个口"（不依赖 IP 规划）
-  verify_extras.py          视觉分支 + 工具调用（tool_calls）验证
-  make_vision_test.py       生成自检用测试图（蓝方块 / 红圆 / 黑条）
-  bench_decode.py / bench_prefill.py / bench_concurrency.py   单流 / 预填 / 并发基准
-  fabric-mtu-route.sh       MTU 9000 + /32 直连路由（用 netplan 持久化）
-  gpu_burn.py               GPU 烧机自检（排除降频锁死）
-  __legacy__/               已作废排查路线的证据，保留备查（**不要照做**）：
-                            apply_aicad_patches.py、patch_nccl_userorder.py、patch_smoke_*.py、
-                            nccl-variant-matrix.sh、nccl_probe_matrix.py、probe-roce-gids.sh、
-                            kernel-driver-switch.sh / -revert.sh（旧内核脚本）
-fleet/                      线上引擎侧**文件本体**快照（md5 与 head 逐字节一致，见 fleet/README.md）
-  start.sh                  head 上实际在跑的启动器（含 9 个透传 + NCCL_CROSS_NIC 默认 0）
-  boot.py                   容器入口（DSPARK_ALIGN_VERIFY_TO_TIER 守护，bind-mount 覆盖镜像内旧版）
-  Dockerfile                剥掉基础镜像残留的 /etc/nccl.conf（否则 pynccl warmup all_reduce 冻死）
-  files/nfs-share.sh        NFS 导出/挂载（mount-spec 修法；start.sh 以相对路径 source）
-  patch_dockerfile_ncclconf.py / patch_bootpy_align_optin.py   上述两处改动的生成器（可重放）
-assets/                     netplan 示例（node3 已按改线后地址更新）+ 已作废的 NCCL 拓扑文件
-env.example                 环境变量样例（已脱敏，RoCE 档 + socket 回退注释）
+docs/DEPLOY-RECORD-dsv41.md          现场主记录（按时间追加的历轮实验日志）
+docs/DEPLOY-GUIDE.md                 完整部署手册         docs/PITFALLS.md   避坑清单（按现象索引）
+docs/INDEXER-CHUNKED-TP3-RESULTS.md  ← 2026-09-26 indexer 移植实测（四臂 A/B、质量门、**负面结论**）
+docs/INDEXER-CHUNKED-TP3-PLAN.md     该移植的事前方案
+docs/BATCH-MIGRATION-2026-09-25.md   2026-09-25 解码栈迁移实测   ADAPTER-MIGRATION-PLAN.md 其事前方
+docs/ROCE-INVESTIGATION.md           历史排查记录（已作废）      docs/UPSTREAM-ISSUE.md  上游 issue + 更正
+
+scripts/                  可直接复用的脚本
+  svc.sh                  服务启停与体检：preflight / start / stop / restart / status / logs
+  svc-boot.sh             开机自启包装            dsv41.service    systemd 单元
+  bench_migration.py      主基准：C1 散文(sampled+greedy) + C1 代码 + C4，每请求唯一 prompt
+  bench_prefill.py        预填基准（唯一 prompt + 扣解码修正）
+  bench_longctx.py        长上下文稳健性（重复 + 并发）
+  patch_startsh_envvar.py 给 start.sh 补 env 透传（head + worker 两处，幂等）
+  patch_autotune_volatile.py  重放 autotune_keep 的 _VOLATILE 改动（幂等、带回滚）
+  probe_indexer_variant.sh    只读探测引擎的 indexer 属于哪个变体
+  run_probe.sh + pynccl_probe3.py   多 communicator 复现探针（**必须用引擎镜像跑**）
+  kernel_switch2.sh       内核/驱动配对切换（带回滚）      gpu_burn.py  GPU 烧机自检
+  ping_matrix.sh / arp_probe.py / measure-fabric.sh   接线与 fabric 验证
+  fabric-mtu-route.sh     MTU 9000 + /32 直连路由        verify_extras.py  视觉 + tool_calls 验证
+  __legacy__/              已作废排查路线的证据，保留备查（**不要照做**）
+
+fleet/                    线上引擎侧**文件本体**快照（17 个 adapter + 4 个部署文件，见 fleet/README.md）
+  Dockerfile              基础镜像之上的 overlay —— **adapter 就是在这里 COPY 进镜像的**
+  start.sh / boot.py / files/nfs-share.sh   启动器 / 容器入口 / NFS 导出（含 14 个 DSV41_* 透传）
+assets/                   netplan 示例 + 已作废的 NCCL 拓扑文件
+env.example               环境变量样例（已脱敏，RoCE 档 + socket 回退注释）
 ```
 
-## 7. 硬件/软件基线（实测环境）
+## 7. 硬件/软件基线
 
 | 项 | 值 |
 |---|---|
 | 节点 | 3 × DGX Spark（GB10），每机 1 颗 GPU，121.7 GiB 统一内存 |
-| 内核 / 驱动 | **`6.17.0-1031-nvidia` / `580.173.02`**（配对标；`7.0.0-1019` 有 CMA 回归，见 §2） |
-| NCCL | 镜像自带 2.30.7（**不需要任何补丁**；早期"补丁 NCCL"实验是为绕开错误接线，现已不需要） |
-| 容器 | 厂商 sglang 镜像 + 官方配方脚本（注意 §2 ② 的 `/etc/nccl.conf`） |
+| 内核 / 驱动 | **`6.17.0-1031-nvidia` / `580.173.02`**（配对标；`7.0.0-1019` 有 CMA 回归，见 §2）|
+| NCCL | 镜像自带 2.30.7（**不需要任何补丁**）|
+| 引擎 | 厂商 sglang 镜像，内部 build `da64c5cbb`（`lmsysorg/sglang:dev-dsv41`）|
+| 容器镜像 | `dsv41-3xspark:local`（由 `fleet/` 的 Dockerfile overlay 构建）|
 
-> DGX 上**驱动与内核是配对的**（`580.173.02 ↔ 6.17.0-1031`、`580.178.04 ↔ 7.0.0-1019`），
+> DGX 上**驱动与内核是配对的**（`580.173.02 ↔ 6.17.0-1031`、`580.178.04 ↔ 7.0.0-1019`）。
 > 换内核必须同时换驱动；降级驱动会卸掉当前内核的驱动模块，所以"降驱动 + 引导旧内核"必须成对做。
 
 ## 8. 已知限制
 
-- SPS（投机解码吞吐表）在当前构建下无法生效（`compact` ragged-verify 启动即崩，三处 shape 不一致），
-  当前用 `static`，表 inert；对并发 ≥2 的场景本可有收益；
-- **已验证（2026-09-19）**：视觉分支（自造 256×256 测试图，蓝方块/红圆/黑条的颜色、形状、位置全对）、工具调用（返回标准 `tool_calls`，DSML 解析器工作）、三台 `swapoff -a`（`/etc/fstab` 已注释，重启不复活）；
-- **单流解码延迟波动（0.9 s ↔ 18 s）：部分处理（2026-09-25）**。启用 `DSV41_AUTOTUNE_KEEP=1`
-  后 autotune 缓存跨重启 `reused`（此前每次启动都重新 tune，各 rank 可能落到不同 tactic），
-  且同一 greedy prompt 连跑 3 次输出 **sha256 完全一致**。**但当初那种秒级延迟抖动本身没有做
-  前后对照测量**，因此不能声称已消除。原排查结论（已排除 GPU 降频：三台 2.1–2.3 GHz、节流位 0x0、
-  以及带宽瓶颈）仍然成立。
-- **长上下文未压测**：`CHUNKED_PREFILL_SIZE=768` 的保护效果未验证。已知 ≤32k 安全；
-  上游在该解码栈 + chunk 1024 下被 ~200k prompt 打爆（`NV_ERR_NO_MEMORY`，主机挂死需硬复位）。
+- **`indexer_chunked` backport 的收益假设经实测落空**（2026-09-26，详见
+  [`docs/INDEXER-CHUNKED-TP3-RESULTS.md`](docs/INDEXER-CHUNKED-TP3-RESULTS.md)）：对性能
+  **无可测影响**，**也不是** `CHUNKED_PREFILL_SIZE=1024` 在长上下文可用的前提（`OFF+1024`
+  到 200k 也全过）。唯一被证实的是**质量零退化**（75 题配对 BROKE=0）。
+  **预填的真正收益来自 chunk 大小本身**（768→1024 约 +11~15%），与该 backport 无关。
+  留它的唯一理由是 >200k 的余量保险——**未验证**（ON 测到 255k，OFF 只到 200k）。
+- **SPS（投机解码吞吐表）在当前构建下无法生效**（`compact` ragged-verify 启动即崩、三处 shape
+  不一致），现用 `SGLANG_RAGGED_VERIFY_MODE=static`，表 inert；对并发 ≥2 本可有收益。
+- **单流解码延迟抖动（历史上 0.9 s ↔ 18 s）只部分处理**：`DSV41_AUTOTUNE_KEEP=1` 后 autotune
+  缓存跨重启 `reused`、同一 greedy prompt 连跑 3 次 sha256 一致，**但那种秒级抖动本身没有做
+  前后对照测量**，不能声称已消除。已排除 GPU 降频（2.1–2.3 GHz、节流位 0x0）与带宽瓶颈。
+- **尾延迟未测**（只有中位数，没有 P50/P99）；**并发只测到 C4**，更高并发与"高并发 × 长上下文"未测。
+- **255k 量级只做过顺序请求**；`OFF+1024` 那组只测到 200k，且未做并发。
+- 已验证（2026-09-19）：视觉分支（自造测试图颜色/形状/位置全对）、工具调用（标准 `tool_calls`）、
+  三台 `swapoff -a`（`/etc/fstab` 已注释，重启不复活）。
 
 ## 9. 许可与致谢
 
 - 本仓库文档与脚本：MIT（见 `LICENSE`）。
 - **例外**：`fleet/` 下派生自上游配方的文件 —— 4 个部署文件（`start.sh`、`boot.py`、`Dockerfile`、
-  `files/nfs-share.sh`）与 `fleet/adapter/` 下 16 个源文件 —— 派生自
+  `files/nfs-share.sh`）与 **`fleet/adapter/` 下全部 17 个源文件** —— 派生自
   [上游配方](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks)（AGPL-3.0-or-later），
   在该目录内按 **AGPL-3.0-or-later** 分发，全文见 `LICENSE.AGPL`。
-  其中 8 个解码 adapter 源自 `knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4`（AGPL-3.0-or-later）；
-  `LICENSE.upstream-MIT` 保留的 0xSero MIT 声明必须随本仓库一并保留。
-  第三方署名与**本地改动声明**见 `NOTICE`；详见 `fleet/README.md`。
+  其中 8 个解码 adapter 源自 `knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4`；`LICENSE.upstream-MIT`
+  保留的 0xSero MIT 声明必须随本仓库一并保留。第三方署名与**本地改动声明**见 `NOTICE`。
 - 不包含任何厂商源码、模型权重或镜像内容；引用的第三方补丁请遵循其各自仓库的许可。
 - 感谢 `luxingcom/aicad-nccl-optimization` 与 LuZ 生产栈作者公开 ring-only 补丁与构建记录：
-  它们在我们接线错误、内核有 CMA 回归的阶段提供了关键对照，也促成了最终定位
-  （结论见 `docs/UPSTREAM-ISSUE.md` 的结案更正）。
+  它们在我们接线错误、内核有 CMA 回归的阶段提供了关键对照，也促成了最终定位。

@@ -1,4 +1,4 @@
-DeepSeek-V4.1-Flash · 3× DGX Spark 部署记录（dsv41-deploy-public）
+DeepSeek-V4.1-Flash · 3× DGX Spark 部署记录（DeepSeek-v4.1-Flash-DGX-Sparks-TP3）
 =============================================================================
 
 本仓库的许可分布
@@ -45,26 +45,34 @@ DeepSeek-V4.1-Flash · 3× DGX Spark 部署记录（dsv41-deploy-public）
 fleet/adapter/ 相对上游的改动。完整且权威的对应源码即本仓库所存文件本身。
 
 fleet/ 部署文件（4 个）：
-  · start.sh           旧式 inline 参数表；新增 12 个 DSV41_* 透传；
-                       NCCL_CROSS_NIC 默认 0
+  · start.sh           旧式 inline 参数表；新增 14 个 DSV41_* 透传
+                       （12 个解码栈 + 2 个 indexer：DSV41_INDEXER_CHUNKED、
+                       DSV41_INDEXER_LOGITS_BUDGET_BYTES）；NCCL_CROSS_NIC 默认 0
   · boot.py            DSPARK_ALIGN_VERIFY_TO_TIER 由无条件改为可选 opt-in
   · Dockerfile         剥离基础镜像自带的 /etc/nccl.conf
                        （NCCL_IB_USE_INLINE / NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS）
   · files/nfs-share.sh mount-spec 修法（与上游的 NFS 加固是两套互补修法）
   · 另新增：svc.sh / svc-boot.sh / dsv41.service 及 3 个补丁生成器（本仓库原创，MIT）
 
-fleet/adapter/（16 个源文件）：
+fleet/adapter/（17 个源文件）：
   · sitecustomize.py —— 本地修改。增加 8 个 env 门控 hook，分别对应
       autotune_keep / engram_prefetch / verify_cap / block_verify / draft_tau /
       folded_result_fence / wo_a_w8 / draft_head_fp8；完整保留上游原有的
       engram_backend / mxfp8_b12x / prefill_empty_cache / encoding_compat /
       loop_abort / tp3_pad / PagedIndexerMetadata 全部逻辑（纯增补，无删除）。
+      2026-09-26 再增 1 个 indexer 分支（deepseek_v4_backend，env 门控
+      DSV41_INDEXER_CHUNKED），仍为纯增补。
   · wo_a_w8.py —— 本地修改。在 einsum bridge 的 _apply 上补 **kw 透传：
       本 fleet 的引擎构建（da64c5cbb）会额外传 is_target_verify 与
       fuse_mxfp8_quant，而针对 37939c26 写的上游签名不接收，导致 FlashInfer
       autotune warm-up 抛 TypeError、引擎无法就绪。
-  · 其余 14 个文件与上游对应版本逐字节一致（其中 7 个同于上游 main，
-    7 个同于 origin/tp3-overnight-decode）。
+  · autotune_keep.py —— 本地修改（2026-09-26）。把 DSV41_INDEXER_CHUNKED 加入
+      _VOLATILE：该开关不触及 FlashInfer 调优的算子形状，若不排除，每次切换都会
+      改变 launch fingerprint 并强制重新 autotune，使针对它的 A/B 被噪声污染。
+      其余逻辑与上游一致。
+  · indexer_chunked.py —— 2026-09-26 取自上游 main（sglang#39187 backport），未改。
+  · 其余 14 个文件与上游对应版本内容一致（其中 7 个同于上游 main、
+      6 个同于 origin/tp3-overnight-decode）。
 
 
 对应源码的获取
